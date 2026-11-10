@@ -1,7 +1,7 @@
 //! Private module for selective re-export. See [`SequentialConsistencyTester`].
 
 use crate::semantics::{ConsistencyTester, SequentialSpec};
-use std::collections::{btree_map, BTreeMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque, btree_map};
 use std::fmt::Debug;
 
 /// This tester captures a potentially concurrent history of operations and
@@ -101,8 +101,11 @@ where
         if let btree_map::Entry::Occupied(occupied_op_entry) = in_flight_elem {
             self.is_valid_history = false;
             return Err(format!(
-                    "Thread already has an operation in flight. thread_id={:?}, op={:?}, history_by_thread={:?}",
-                    thread_id, occupied_op_entry.get(), self.history_by_thread));
+                "Thread already has an operation in flight. thread_id={:?}, op={:?}, history_by_thread={:?}",
+                thread_id,
+                occupied_op_entry.get(),
+                self.history_by_thread
+            ));
         };
         in_flight_elem.or_insert(op);
         self.history_by_thread.entry(thread_id).or_default(); // `serialize` requires entry

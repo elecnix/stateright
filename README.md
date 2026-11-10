@@ -18,6 +18,30 @@ as [Jepsen](https://jepsen.io/).
 
 ![Stateright Explorer screenshot](https://raw.githubusercontent.com/stateright/stateright/master/explorer.png)
 
+## About this fork
+
+This is elecnix's fork of [stateright/stateright](https://github.com/stateright/stateright).
+It keeps the library API of the upstream 0.31.0 release and adds a
+command-line checker for declarative JSON models. Releases carry prebuilt
+binaries, so a CI job can check a model without a Rust toolchain.
+
+### Code review key
+
+Pull requests on this repository get an automated review from
+[Cite](https://github.com/elecnix/cite), run by `.github/workflows/review.yml`.
+That workflow reads three repository secrets: `MODEL_API_KEY`,
+`MODEL_BASE_URL` and `MODEL_ID`. The key is dedicated to this repository. It
+can send chat-completion requests to one staging model gateway and do nothing
+else: it can't read or change gateway configuration, other keys, or any
+production system. The workflow runs on `pull_request_target`, never checks
+out pull request code, and skips pull requests from other forks, so a fork
+can't spend the key.
+
+Anyone who can push to this repository can edit the workflows that read
+these secrets, and through them use the key. Today only the repository owner
+has push access.
+
+
 ## Getting Started
 
 1. **Please see the book, "[Building Distributed Systems With

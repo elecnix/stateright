@@ -3,9 +3,9 @@
 
 use std::borrow::Cow;
 
-use choice::{choice, Choice};
-use stateright::actor::{model_timeout, Actor, ActorModel, Id, Out};
-use stateright::{report::WriteReporter, Checker, Expectation, Model};
+use choice::{Choice, choice};
+use stateright::actor::{Actor, ActorModel, Id, Out, model_timeout};
+use stateright::{Checker, Expectation, Model, report::WriteReporter};
 
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -186,10 +186,10 @@ impl Actor for Client {
         msg: Self::Msg,
         _o: &mut Out<Self>,
     ) {
-        if let Msg::ReplyCount(n) = msg {
-            if n >= self.threshold {
-                state.to_mut().success = true;
-            }
+        if let Msg::ReplyCount(n) = msg
+            && n >= self.threshold
+        {
+            state.to_mut().success = true;
         }
     }
 

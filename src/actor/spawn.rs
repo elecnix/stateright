@@ -189,7 +189,8 @@ fn on_command<A, E>(
             match msg_serialize(&msg) {
                 Err(e) => {
                     log::warn!(
-                        "Unable to serialize. Ignoring. src={addr}, dst={dst_addr}, msg={msg:?}, err={e:?}");
+                        "Unable to serialize. Ignoring. src={addr}, dst={dst_addr}, msg={msg:?}, err={e:?}"
+                    );
                 }
                 Ok(out_buf) => {
                     if let Err(e) = socket.send_to(&out_buf, dst_addr) {

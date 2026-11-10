@@ -4,8 +4,8 @@
 use stateright::actor::register::{RegisterActor, RegisterMsg, RegisterMsg::*};
 use stateright::actor::{Actor, ActorModel, Id, Network, Out};
 use stateright::report::WriteReporter;
-use stateright::semantics::register::Register;
 use stateright::semantics::LinearizabilityTester;
+use stateright::semantics::register::Register;
 use stateright::{Checker, Expectation, Model};
 use std::borrow::Cow;
 
@@ -78,10 +78,10 @@ impl SingleCopyModelCfg {
         })
         .property(Expectation::Sometimes, "value chosen", |_, state| {
             for env in state.network.iter_deliverable() {
-                if let RegisterMsg::GetOk(_req_id, value) = env.msg {
-                    if *value != Value::default() {
-                        return true;
-                    }
+                if let RegisterMsg::GetOk(_req_id, value) = env.msg
+                    && *value != Value::default()
+                {
+                    return true;
                 }
             }
             false

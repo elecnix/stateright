@@ -1,7 +1,7 @@
+use stateright::Checker;
 use stateright::actor::model_timeout;
 use stateright::actor::{Actor, ActorModel, Id, Network, Out};
 use stateright::report::WriteReporter;
-use stateright::Checker;
 use stateright::{Expectation, Model};
 use std::borrow::Cow;
 use std::cmp::min;
@@ -499,10 +499,10 @@ impl RaftModelCfg {
                         .get(i)
                         .unwrap();
                     for s in &state.actor_states {
-                        if let Some(log) = s.delivered_messages.get(i) {
-                            if log != ref_log {
-                                return false;
-                            }
+                        if let Some(log) = s.delivered_messages.get(i)
+                            && log != ref_log
+                        {
+                            return false;
                         }
                     }
                 }

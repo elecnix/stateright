@@ -2,14 +2,14 @@
 
 use crate::checker::{Checker, EventuallyBits, Expectation, Path};
 use crate::job_market::JobBroker;
-use crate::{fingerprint, CheckerBuilder, CheckerVisitor, Fingerprint, Model, Property};
+use crate::{CheckerBuilder, CheckerVisitor, Fingerprint, Model, Property, fingerprint};
 use dashmap::{DashMap, DashSet};
 use nohash_hasher::NoHashHasher;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasherDefault, Hash};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::SystemTime;
 
@@ -148,15 +148,15 @@ where
                                 );
                                 return;
                             }
-                            if let Some(target_state_count) = target_state_count {
-                                if target_state_count.get() <= state_count.load(Ordering::Relaxed) {
-                                    log::debug!(
-                                        "{}: Reached target state count. Shutting down... gen={}",
-                                        t,
-                                        generated.len()
-                                    );
-                                    return;
-                                }
+                            if let Some(target_state_count) = target_state_count
+                                && target_state_count.get() <= state_count.load(Ordering::Relaxed)
+                            {
+                                log::debug!(
+                                    "{}: Reached target state count. Shutting down... gen={}",
+                                    t,
+                                    generated.len()
+                                );
+                                return;
                             }
 
                             // Step 2: Share work.
@@ -223,11 +223,11 @@ where
                 current_max_depth = max_depth.get();
             }
 
-            if let Some(target_max_depth) = target_max_depth {
-                if max_depth >= target_max_depth {
-                    log::trace!("Skipping state as past max depth {max_depth}");
-                    continue;
-                }
+            if let Some(target_max_depth) = target_max_depth
+                && max_depth >= target_max_depth
+            {
+                log::trace!("Skipping state as past max depth {max_depth}");
+                continue;
             }
             if let Some(visitor) = visitor {
                 visitor.visit(
@@ -488,7 +488,7 @@ mod test {
             checker.discovery("solvable").unwrap().into_actions(),
             vec![Guess::IncreaseY; 27]
         ); // (2*0 + 10*27) % 256 == 14
-           // ... but there are of course other solutions, such as the following.
+        // ... but there are of course other solutions, such as the following.
         checker.assert_discovery(
             "solvable",
             vec![Guess::IncreaseX, Guess::IncreaseY, Guess::IncreaseX],

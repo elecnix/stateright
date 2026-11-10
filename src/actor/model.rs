@@ -1,8 +1,8 @@
 //! Private module for selective re-export.
 
 use crate::actor::{
-    is_no_op, is_no_op_with_timer, Actor, ActorModelState, Command, Envelope, Id, Network, Out,
-    RandomChoices,
+    Actor, ActorModelState, Command, Envelope, Id, Network, Out, RandomChoices, is_no_op,
+    is_no_op_with_timer,
 };
 use crate::{Expectation, Model, Path, Property};
 use std::borrow::Cow;
@@ -556,9 +556,9 @@ where
             ActorModelAction::Drop(env) => Some(format!("DROP: {env:?}")),
             ActorModelAction::Deliver { src, dst: id, msg } => {
                 let index = usize::from(id);
-                let last_actor_state = match last_state.actor_states.get(index) {
-                    None => return None,
-                    Some(last_actor_state) => &**last_actor_state,
+                let last_actor_state = {
+                    let last_actor_state = last_state.actor_states.get(index)?;
+                    &**last_actor_state
                 };
                 let mut actor_state = Cow::Borrowed(last_actor_state);
                 let mut out = Out::new();
@@ -577,9 +577,9 @@ where
             }
             ActorModelAction::Timeout(id, timer) => {
                 let index = usize::from(id);
-                let last_actor_state = match last_state.actor_states.get(index) {
-                    None => return None,
-                    Some(last_actor_state) => &**last_actor_state,
+                let last_actor_state = {
+                    let last_actor_state = last_state.actor_states.get(index)?;
+                    &**last_actor_state
                 };
                 let mut actor_state = Cow::Borrowed(last_actor_state);
                 let mut out = Out::new();
@@ -611,9 +611,9 @@ where
             }
             ActorModelAction::Recover(id) => {
                 let index = usize::from(id);
-                let last_actor_state = match last_state.actor_states.get(index) {
-                    None => return None,
-                    Some(last_actor_state) => &**last_actor_state,
+                let last_actor_state = {
+                    let last_actor_state = last_state.actor_states.get(index)?;
+                    &**last_actor_state
                 };
                 let mut out = Out::new();
                 let actor_state =
@@ -633,9 +633,9 @@ where
                 random,
             } => {
                 let index = usize::from(actor);
-                let last_actor_state = match last_state.actor_states.get(index) {
-                    None => return None,
-                    Some(last_actor_state) => &**last_actor_state,
+                let last_actor_state = {
+                    let last_actor_state = last_state.actor_states.get(index)?;
+                    &**last_actor_state
                 };
                 let mut actor_state = Cow::Borrowed(last_actor_state);
                 let mut out = Out::new();
@@ -879,8 +879,8 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::actor::actor_test_util::ping_pong::{PingPongCfg, PingPongMsg, PingPongMsg::*};
     use crate::actor::ActorModelAction::*;
+    use crate::actor::actor_test_util::ping_pong::{PingPongCfg, PingPongMsg, PingPongMsg::*};
     use crate::{Checker, PathRecorder, StateRecorder};
     use std::collections::{BTreeSet, HashSet};
     use std::sync::Arc;

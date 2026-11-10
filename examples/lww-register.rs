@@ -2,10 +2,10 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 
 use serde::{Deserialize, Serialize};
 use stateright::{
-    actor::{spawn, Actor, ActorModel, Id},
+    CheckerBuilder, Model,
+    actor::{Actor, ActorModel, Id, spawn},
     report::WriteReporter,
     util::HashableHashMap,
-    CheckerBuilder, Model,
 };
 
 /// A Last Write Wins (LWW) register, implemented as a state-based CRDT.

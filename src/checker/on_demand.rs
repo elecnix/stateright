@@ -3,16 +3,16 @@
 use crate::checker::{Checker, EventuallyBits, Expectation, Path};
 use crate::job_market::JobBroker;
 use crate::{
-    fingerprint, CheckerBuilder, CheckerVisitor, ControlFlow, Fingerprint, Model, Property,
+    CheckerBuilder, CheckerVisitor, ControlFlow, Fingerprint, Model, Property, fingerprint,
 };
-use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use nohash_hasher::NoHashHasher;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasherDefault, Hash};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::SystemTime;
 
@@ -205,8 +205,8 @@ where
                                 );
                                 return;
                             }
-                            if let Some(target_state_count) = target_state_count {
-                                if target_state_count.get() <= state_count.load(Ordering::Relaxed) {
+                            if let Some(target_state_count) = target_state_count
+                                && target_state_count.get() <= state_count.load(Ordering::Relaxed) {
                                     log::debug!(
                                         "{}: Reached target state count. Shutting down... gen={}",
                                         t,
@@ -214,7 +214,6 @@ where
                                     );
                                     return;
                                 }
-                            }
 
                             // Step 2: Share work.
                             if pending.len() > 1 && thread_count > 1 {
@@ -378,19 +377,22 @@ where
                 // property held on the path leading to the first visit as meaning
                 // that it holds in the path leading to the second visit -- another
                 // possible false-negative.
-                if let Entry::Vacant(next_entry) = generated.entry(next_fp) {
-                    next_entry.insert(Some(state_fp));
-                } else {
-                    // FIXME: arriving at an already-known state may be a loop (in which case it
-                    // could, in a fancier implementation, be considered a terminal state for
-                    // purposes of eventually-property checking) but it might also be a join in
-                    // a DAG, which makes it non-terminal. These cases can be disambiguated (at
-                    // some cost), but for now we just _don't_ treat them as terminal, and tell
-                    // users they need to explicitly ensure model path-acyclicality when they're
-                    // using eventually properties (using a boundary or empty actions or
-                    // whatever).
-                    is_terminal = false;
-                    continue;
+                match generated.entry(next_fp) {
+                    Entry::Vacant(next_entry) => {
+                        next_entry.insert(Some(state_fp));
+                    }
+                    _ => {
+                        // FIXME: arriving at an already-known state may be a loop (in which case it
+                        // could, in a fancier implementation, be considered a terminal state for
+                        // purposes of eventually-property checking) but it might also be a join in
+                        // a DAG, which makes it non-terminal. These cases can be disambiguated (at
+                        // some cost), but for now we just _don't_ treat them as terminal, and tell
+                        // users they need to explicitly ensure model path-acyclicality when they're
+                        // using eventually properties (using a boundary or empty actions or
+                        // whatever).
+                        is_terminal = false;
+                        continue;
+                    }
                 }
 
                 // Otherwise further checking is applicable.

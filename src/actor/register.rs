@@ -4,8 +4,8 @@
 #[cfg(doc)]
 use crate::actor::ActorModel;
 use crate::actor::{Actor, Envelope, Id, Out};
-use crate::semantics::register::{Register, RegisterOp, RegisterRet};
 use crate::semantics::ConsistencyTester;
+use crate::semantics::register::{Register, RegisterOp, RegisterRet};
 use std::borrow::Cow;
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -134,11 +134,7 @@ where
             RegisterActor::Client { .. } => "Client".to_owned(),
             RegisterActor::Server(s) => {
                 let n = s.name();
-                if n.is_empty() {
-                    "Server".to_owned()
-                } else {
-                    n
-                }
+                if n.is_empty() { "Server".to_owned() } else { n }
             }
         }
     }

@@ -1,17 +1,17 @@
 //! Private module for selective re-export.
 
 use crate::checker::{Checker, Expectation, Path};
-use crate::{fingerprint, CheckerBuilder, CheckerVisitor, Model, Property};
+use crate::{CheckerBuilder, CheckerVisitor, Model, Property, fingerprint};
 use dashmap::DashMap;
-use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::thread::{sleep, JoinHandle};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread::{JoinHandle, sleep};
 use std::time::{Duration, SystemTime};
 
 use super::EventuallyBits;
@@ -125,16 +125,18 @@ where
             let closing_time = SystemTime::now() + close_after;
             std::thread::Builder::new()
                 .name("timeout".to_owned())
-                .spawn(move || loop {
-                    let now = SystemTime::now();
-                    if closing_time < now {
-                        log::debug!("Reached timeout, triggering shutdown");
-                        sd.store(true, Ordering::Relaxed);
+                .spawn(move || {
+                    loop {
+                        let now = SystemTime::now();
+                        if closing_time < now {
+                            log::debug!("Reached timeout, triggering shutdown");
+                            sd.store(true, Ordering::Relaxed);
+                        }
+                        if sd.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        sleep(Duration::from_secs(1));
                     }
-                    if sd.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    sleep(Duration::from_secs(1));
                 })
                 .unwrap();
         }
@@ -185,13 +187,11 @@ where
                                 log::debug!("{t}: Discovery complete. Shutting down...");
                                 return;
                             }
-                            if let Some(target_state_count) = target_state_count {
-                                if target_state_count.get() <= state_count.load(Ordering::Relaxed) {
-                                    log::debug!(
-                                        "{t}: Reached target state count. Shutting down..."
-                                    );
-                                    return;
-                                }
+                            if let Some(target_state_count) = target_state_count
+                                && target_state_count.get() <= state_count.load(Ordering::Relaxed)
+                            {
+                                log::debug!("{t}: Reached target state count. Shutting down...");
+                                return;
                             }
 
                             seed = rng.random();
@@ -267,16 +267,16 @@ where
                 );
                 current_max_depth = action_path.len() - 1;
             }
-            if let Some(target_max_depth) = target_max_depth {
-                if action_path.len() > target_max_depth.get() {
-                    log::trace!(
-                        "Skipping exploring more states as past max depth {}",
-                        action_path.len() - 1
-                    );
-                    // return not break here as we do not know if this is terminal.
-                    log::trace!("Reached max depth");
-                    return;
-                }
+            if let Some(target_max_depth) = target_max_depth
+                && action_path.len() > target_max_depth.get()
+            {
+                log::trace!(
+                    "Skipping exploring more states as past max depth {}",
+                    action_path.len() - 1
+                );
+                // return not break here as we do not know if this is terminal.
+                log::trace!("Reached max depth");
+                return;
             }
 
             // Skip if outside boundary.

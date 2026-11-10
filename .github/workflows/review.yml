@@ -1,0 +1,25 @@
+name: review
+
+# Code review by Cite (https://github.com/elecnix/cite). The job reads the pull
+# request through the GitHub API and never checks out or runs its code, so the
+# model key it holds stays away from code a pull request controls.
+on: pull_request_target
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+jobs:
+  review:
+    # Only branches of this repository are reviewed; a pull request from
+    # another fork is skipped and cannot spend the key. The comparison is by
+    # name because this repository is itself a fork.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: elecnix/cite@1460a96b67ac425466c7bde99597d1e312ee8408 # v0.16.1
+        env:
+          MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
+          MODEL_BASE_URL: ${{ secrets.MODEL_BASE_URL }}
+          MODEL_ID: ${{ secrets.MODEL_ID }}
