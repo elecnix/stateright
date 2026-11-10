@@ -14,7 +14,7 @@ mod value;
 
 pub use check::{CheckOptions, CheckReport, check};
 pub use model::{JsonAction, JsonModel, JsonState, MAX_INVARIANTS, SCHEMA_VERSION};
-pub use value::{Sym, Value};
+pub use value::{Hashed, Sym, Value};
 
 #[cfg(test)]
 mod tests;

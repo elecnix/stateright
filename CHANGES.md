@@ -13,6 +13,10 @@
   when a shorter path reaches it.
 - BFS: an `always` or `sometimes` discovery keeps the shortest path found,
   rather than the last one written.
+- BFS: the path to a successor state is built after the duplicate test, in
+  one allocation. Before, every generated state copied its path twice.
+- Declarative models: each list and record remembers its hash, so the
+  fingerprint of a successor state hashes only the values the step changed.
 - Edition 2024, `rust-version = "1.88"`.
 
 ## 0.31.0

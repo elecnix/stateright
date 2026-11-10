@@ -1,6 +1,6 @@
 //! Expressions and effects: compilation from JSON and evaluation.
 
-use super::value::{Show, Sym, Symbols, Value};
+use super::value::{Hashed, Show, Sym, Symbols, Value};
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -125,7 +125,7 @@ pub(crate) struct Def {
 /// The values an iteration or an action parameter ranges over. A `range`
 /// is iterated without building its list.
 pub(crate) enum Domain {
-    List(Arc<Vec<Value>>),
+    List(Arc<Hashed<Value>>),
     Range(i64, usize),
 }
 
@@ -341,7 +341,7 @@ pub(crate) fn compile(scope: &mut Scope, json: &Json, at: &str) -> Result<Expr, 
                         _ => unreachable!(),
                     })
                     .collect();
-                Expr::Lit(Value::Rec(Arc::new(fields)))
+                Expr::Lit(Value::rec(fields))
             } else {
                 Expr::Rec(out)
             }
@@ -744,7 +744,7 @@ impl Ctx<'_> {
                 for (k, v) in fields {
                     out.push((*k, self.eval(v, state, base)?));
                 }
-                Value::Rec(Arc::new(out))
+                Value::rec(out)
             }
             Expr::Get(x, k, default) => {
                 let x = self.eval(x, state, base)?;
@@ -890,7 +890,7 @@ impl Ctx<'_> {
                         Show(self.symbols, &i)
                     )));
                 };
-                Arc::make_mut(&mut items)[i] = v;
+                Hashed::make_mut(&mut items)[i] = v;
                 Value::List(items)
             }
             Expr::With(r, k, v) => {
@@ -900,7 +900,7 @@ impl Ctx<'_> {
                 let (Value::Rec(mut fields), Value::Str(k)) = (rec.clone(), &k) else {
                     return type_error(self, "with", &rec);
                 };
-                let fields_mut = Arc::make_mut(&mut fields);
+                let fields_mut = Hashed::make_mut(&mut fields);
                 match fields_mut.binary_search_by_key(k, |(k, _)| *k) {
                     Ok(i) => fields_mut[i].1 = v,
                     Err(i) => fields_mut.insert(i, (*k, v)),
@@ -1229,7 +1229,7 @@ impl Ctx<'_> {
                     let v = self.eval(value, state, base)?;
                     self.update(&mut state[*field], &keys, |ctx, slot| match slot {
                         Value::List(l) => {
-                            Arc::make_mut(l).push(v);
+                            Hashed::make_mut(l).push(v);
                             Ok(())
                         }
                         other => type_error(ctx, "append", other),
@@ -1251,7 +1251,7 @@ impl Ctx<'_> {
                     self.update(&mut state[*field], &keys, |ctx, slot| match slot {
                         Value::List(l) => match index(ctx, l.len(), &at, "remove")? {
                             Some(i) => {
-                                Arc::make_mut(l).remove(i);
+                                Hashed::make_mut(l).remove(i);
                                 Ok(())
                             }
                             None => Err(EvalError::from(format!(
@@ -1309,10 +1309,10 @@ impl Ctx<'_> {
                             Show(self.symbols, k)
                         )));
                     };
-                    &mut Arc::make_mut(l)[i]
+                    &mut Hashed::make_mut(l)[i]
                 }
                 (Value::Rec(r), Value::Str(s)) => {
-                    let r = Arc::make_mut(r);
+                    let r = Hashed::make_mut(r);
                     let i = match r.binary_search_by_key(s, |(k, _)| *k) {
                         Ok(i) => i,
                         Err(i) => {
