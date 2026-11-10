@@ -5,8 +5,8 @@
 use crate::actor::ActorModel;
 use crate::actor::{Actor, Envelope, Id, Out};
 use crate::checker::{Rewrite, RewritePlan};
-use crate::semantics::write_once_register::{WORegister, WORegisterOp, WORegisterRet};
 use crate::semantics::ConsistencyTester;
+use crate::semantics::write_once_register::{WORegister, WORegisterOp, WORegisterRet};
 use std::borrow::Cow;
 use std::fmt::Debug;
 use std::hash::Hash;

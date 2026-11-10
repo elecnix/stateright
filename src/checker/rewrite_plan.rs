@@ -1,7 +1,7 @@
 //! Private module for selective re-export.
 
-use crate::util::DenseNatMap;
 use crate::Rewrite;
+use crate::util::DenseNatMap;
 use std::fmt;
 use std::iter::FromIterator;
 use std::ops::Index;

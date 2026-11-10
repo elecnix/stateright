@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use stateright::actor::model_timeout;
-use stateright::actor::{model_peers, Actor, ActorModel, Id, Network, Out};
+use stateright::actor::{Actor, ActorModel, Id, Network, Out, model_peers};
 use stateright::report::WriteReporter;
 use stateright::{Checker, Model};
 use std::borrow::Cow;

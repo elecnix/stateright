@@ -1,7 +1,7 @@
 //! Private module for selective re-export. See [`LinearizabilityTester`].
 
 use crate::semantics::{ConsistencyTester, SequentialSpec};
-use std::collections::{btree_map, BTreeMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque, btree_map};
 use std::fmt::Debug;
 
 // This implementation is based on `SequentialConsistencyTester` and will be
@@ -108,8 +108,9 @@ where
             self.is_valid_history = false;
             let (_, op) = occupied_op_entry.get();
             return Err(format!(
-                    "Thread already has an operation in flight. thread_id={:?}, op={:?}, history_by_thread={:?}",
-                    thread_id, op, self.history_by_thread));
+                "Thread already has an operation in flight. thread_id={:?}, op={:?}, history_by_thread={:?}",
+                thread_id, op, self.history_by_thread
+            ));
         };
         let last_completed = self
             .history_by_thread
@@ -220,12 +221,11 @@ where
                 let (cs, op) = in_flight_by_thread.to_mut().remove(thread_id).unwrap(); // `contains_key` above
                 let violation = cs.iter().any(|(peer_id, min_peer_time)| {
                     // Ensure all pre-req operations were completed by peers
-                    if let Some(ops) = remaining_history_by_thread.get(peer_id) {
-                        if let Some((next_peer_time, _)) = ops.iter().next() {
-                            if next_peer_time <= min_peer_time {
-                                return true;
-                            }
-                        }
+                    if let Some(ops) = remaining_history_by_thread.get(peer_id)
+                        && let Some((next_peer_time, _)) = ops.iter().next()
+                        && next_peer_time <= min_peer_time
+                    {
+                        return true;
                     }
                     false
                 });
@@ -247,12 +247,11 @@ where
                     .unwrap(); // `!is_empty()` above
                 let violation = cs.iter().any(|(peer_id, min_peer_time)| {
                     // Ensure all pre-req operations were completed by peers
-                    if let Some(ops) = remaining_history_by_thread.get(peer_id) {
-                        if let Some((next_peer_time, _)) = ops.iter().next() {
-                            if next_peer_time <= min_peer_time {
-                                return true;
-                            }
-                        }
+                    if let Some(ops) = remaining_history_by_thread.get(peer_id)
+                        && let Some((next_peer_time, _)) = ops.iter().next()
+                        && next_peer_time <= min_peer_time
+                    {
+                        return true;
                     }
                     false
                 });

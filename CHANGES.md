@@ -1,5 +1,20 @@
 # Changes
 
+## 0.32.0-ec.1 (elecnix fork)
+
+- Add `stateright::declarative`: transition systems written as JSON, with
+  guarded actions, effects, invariants on states and on steps, and a depth
+  bound. The `stateright check MODEL.json` binary checks such a file and
+  prints a JSON report with traces.
+- BFS: states at `target_max_depth` are now checked; before, they were
+  counted but never checked.
+- BFS: with several threads, `target_max_depth` now explores every state
+  within the bound. A state first reached by a longer path is expanded again
+  when a shorter path reaches it.
+- BFS: an `always` or `sometimes` discovery keeps the shortest path found,
+  rather than the last one written.
+- Edition 2024, `rust-version = "1.88"`.
+
 ## 0.31.0
 
 Andrew Jeffery <dev@jeffas.io>

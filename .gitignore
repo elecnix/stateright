@@ -1,6 +1,7 @@
 *.bk
 *.iml
-Cargo.lock
 *.swp
 .*
 target/
+!.github/
+__pycache__/

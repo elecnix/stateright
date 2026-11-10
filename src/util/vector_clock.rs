@@ -1,6 +1,6 @@
 //! Private module for selective re-export.
 
-use std::cmp::{max, Ordering};
+use std::cmp::{Ordering, max};
 use std::fmt::{self, Display, Formatter};
 use std::hash::{Hash, Hasher};
 
@@ -137,7 +137,7 @@ mod test {
         use std::collections::hash_map::DefaultHasher;
 
         macro_rules! assert_hash_eq {
-            ($v1:expr, $v2:expr) => {
+            ($v1:expr_2021, $v2:expr_2021) => {
                 let mut h1 = DefaultHasher::new();
                 let mut h2 = DefaultHasher::new();
                 $v1.hash(&mut h1);
@@ -146,7 +146,7 @@ mod test {
             };
         }
         macro_rules! assert_hash_ne {
-            ($v1:expr, $v2:expr) => {
+            ($v1:expr_2021, $v2:expr_2021) => {
                 let mut h1 = DefaultHasher::new();
                 let mut h2 = DefaultHasher::new();
                 $v1.hash(&mut h1);

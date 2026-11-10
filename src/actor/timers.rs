@@ -1,4 +1,4 @@
-use crate::{util::HashableHashSet, Rewrite, RewritePlan};
+use crate::{Rewrite, RewritePlan, util::HashableHashSet};
 use std::hash::Hash;
 
 use super::Id;

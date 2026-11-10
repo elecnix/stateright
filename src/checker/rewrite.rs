@@ -1,8 +1,8 @@
 //! Private module for selective re-export.
 
+use crate::RewritePlan;
 use crate::actor::{Envelope, Id};
 use crate::util::{HashableHashMap, HashableHashSet};
-use crate::RewritePlan;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::Hash;
 use std::sync::Arc;

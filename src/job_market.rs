@@ -89,33 +89,36 @@ impl<Job> JobBroker<Job> {
             return VecDeque::new();
         }
         loop {
-            if let Some(jobs) = market.job_batches.pop() {
-                log::trace!(
-                    "{}: Got jobs. Working.",
-                    std::thread::current().name().unwrap_or_default()
-                );
-                return jobs;
-            } else {
-                // Otherwise more work may become available.
-                market.open_count = market.open_count.saturating_sub(1);
-                if market.open_count == 0 {
-                    // we are the last running thread, notify all others and return so we can
-                    // shut down properly
+            match market.job_batches.pop() {
+                Some(jobs) => {
                     log::trace!(
-                        "{}: No jobs. Last running thread.",
+                        "{}: Got jobs. Working.",
                         std::thread::current().name().unwrap_or_default()
                     );
-                    self.has_new_jobs.notify_all();
-                    market.open = false;
-                    return VecDeque::new();
+                    return jobs;
                 }
-                log::trace!(
-                    "{}: No jobs. Awaiting. running={}",
-                    std::thread::current().name().unwrap_or_default(),
-                    market.open_count
-                );
-                self.has_new_jobs.wait(&mut market);
-                market.open_count += 1;
+                _ => {
+                    // Otherwise more work may become available.
+                    market.open_count = market.open_count.saturating_sub(1);
+                    if market.open_count == 0 {
+                        // we are the last running thread, notify all others and return so we can
+                        // shut down properly
+                        log::trace!(
+                            "{}: No jobs. Last running thread.",
+                            std::thread::current().name().unwrap_or_default()
+                        );
+                        self.has_new_jobs.notify_all();
+                        market.open = false;
+                        return VecDeque::new();
+                    }
+                    log::trace!(
+                        "{}: No jobs. Awaiting. running={}",
+                        std::thread::current().name().unwrap_or_default(),
+                        market.open_count
+                    );
+                    self.has_new_jobs.wait(&mut market);
+                    market.open_count += 1;
+                }
             }
         }
     }

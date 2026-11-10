@@ -2,15 +2,15 @@
 
 use crate::checker::{Checker, EventuallyBits, Expectation, Path};
 use crate::job_market::JobBroker;
-use crate::{fingerprint, CheckerBuilder, CheckerVisitor, Fingerprint, Model, Property};
-use dashmap::mapref::entry::Entry;
+use crate::{CheckerBuilder, CheckerVisitor, Fingerprint, Model, Property, fingerprint};
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use nohash_hasher::NoHashHasher;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasherDefault, Hash};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::SystemTime;
 
@@ -26,15 +26,15 @@ pub(crate) struct BfsChecker<M: Model> {
     job_broker: JobBroker<Job<M::State>>,
     state_count: Arc<AtomicUsize>,
     max_depth: Arc<AtomicUsize>,
-    generated:
-        Arc<DashMap<Fingerprint, Option<Fingerprint>, BuildHasherDefault<NoHashHasher<u64>>>>,
+    /// The depth of the shortest path found so far to each generated state.
+    generated: Arc<DashMap<Fingerprint, NonZeroUsize, BuildHasherDefault<NoHashHasher<u64>>>>,
     // In the original fingerprint-based Path construction, the value type of `discovery` was a
     // single fingerprint since the path could be reconstructed in reverse using the parent
     // relationships in `generated`. However, with action indices encoding, this is not possible,
     // so we must store a Vec (like in dfs.rs).
     discoveries: Arc<DashMap<&'static str, Vec<usize>>>,
 }
-type Job<State> = (State, Fingerprint, EventuallyBits, NonZeroUsize, Vec<usize>);
+type Job<State> = (State, EventuallyBits, NonZeroUsize, Vec<usize>);
 
 impl<M> BfsChecker<M>
 where
@@ -64,7 +64,7 @@ where
         let generated = Arc::new({
             let generated = DashMap::default();
             for s in &init_states {
-                generated.insert(fingerprint(s), None);
+                generated.insert(fingerprint(s), NonZeroUsize::new(1).unwrap());
             }
             generated
         });
@@ -84,10 +84,7 @@ where
         let pending: VecDeque<_> = init_states
             .into_iter()
             .enumerate()
-            .map(|(i, s)| {
-                let fp = fingerprint(&s);
-                (s, fp, ebits.clone(), NonZeroUsize::new(1).unwrap(), vec![i])
-            })
+            .map(|(i, s)| (s, ebits.clone(), NonZeroUsize::new(1).unwrap(), vec![i]))
             .collect();
         let discoveries = Arc::new(DashMap::default());
         let mut handles = Vec::new();
@@ -151,15 +148,15 @@ where
                                 );
                                 return;
                             }
-                            if let Some(target_state_count) = target_state_count {
-                                if target_state_count.get() <= state_count.load(Ordering::Relaxed) {
-                                    log::debug!(
-                                        "{}: Reached target state count. Shutting down... gen={}",
-                                        t,
-                                        generated.len()
-                                    );
-                                    return;
-                                }
+                            if let Some(target_state_count) = target_state_count
+                                && target_state_count.get() <= state_count.load(Ordering::Relaxed)
+                            {
+                                log::debug!(
+                                    "{}: Reached target state count. Shutting down... gen={}",
+                                    t,
+                                    generated.len()
+                                );
+                                return;
                             }
 
                             // Step 2: Share work.
@@ -186,11 +183,7 @@ where
     fn check_block(
         model: &M,
         state_count: &AtomicUsize,
-        generated: &DashMap<
-            Fingerprint,
-            Option<Fingerprint>,
-            BuildHasherDefault<NoHashHasher<u64>>,
-        >,
+        generated: &DashMap<Fingerprint, NonZeroUsize, BuildHasherDefault<NoHashHasher<u64>>>,
         pending: &mut VecDeque<Job<M::State>>,
         discoveries: &DashMap<&'static str, Vec<usize>>,
         visitor: &Option<Box<dyn CheckerVisitor<M> + Send + Sync>>,
@@ -213,7 +206,7 @@ where
             max_count -= 1;
 
             // Done if none pending.
-            let (state, state_fp, mut ebits, max_depth, action_path) = match pending.pop_back() {
+            let (state, mut ebits, max_depth, action_path) = match pending.pop_back() {
                 None => return,
                 Some(pair) => pair,
             };
@@ -226,13 +219,6 @@ where
                     Ordering::Relaxed,
                 );
                 current_max_depth = max_depth.get();
-            }
-
-            if let Some(target_max_depth) = target_max_depth {
-                if max_depth >= target_max_depth {
-                    log::trace!("Skipping state as past max depth {max_depth}");
-                    continue;
-                }
             }
 
             if let Some(visitor) = visitor {
@@ -258,8 +244,7 @@ where
                         ..
                     } => {
                         if !always(model, &state) {
-                            // Races other threads, but that's fine.
-                            discoveries.insert(property.name, action_path.clone());
+                            record_discovery(discoveries, property.name, &action_path);
                         } else {
                             is_awaiting_discoveries = true;
                         }
@@ -270,8 +255,7 @@ where
                         ..
                     } => {
                         if sometimes(model, &state) {
-                            // Races other threads, but that's fine.
-                            discoveries.insert(property.name, action_path.clone());
+                            record_discovery(discoveries, property.name, &action_path);
                         } else {
                             is_awaiting_discoveries = true;
                         }
@@ -295,6 +279,14 @@ where
             }
             if !is_awaiting_discoveries {
                 return;
+            }
+
+            // States at the depth limit are checked above but not expanded.
+            if let Some(target_max_depth) = target_max_depth
+                && max_depth >= target_max_depth
+            {
+                log::trace!("Not expanding state at max depth {max_depth}");
+                continue;
             }
 
             // Otherwise enqueue newly generated states (with related metadata).
@@ -323,38 +315,63 @@ where
                 // that it holds in the path leading to the second visit -- another
                 // possible false-negative.
                 let next_fingerprint = fingerprint(&next_state);
-                if let Entry::Vacant(next_entry) = generated.entry(next_fingerprint) {
-                    next_entry.insert(Some(state_fp));
-                } else {
-                    // FIXME: arriving at an already-known state may be a loop (in which case it
-                    // could, in a fancier implementation, be considered a terminal state for
-                    // purposes of eventually-property checking) but it might also be a join in
-                    // a DAG, which makes it non-terminal. These cases can be disambiguated (at
-                    // some cost), but for now we just _don't_ treat them as terminal, and tell
-                    // users they need to explicitly ensure model path-acyclicality when they're
-                    // using eventually properties (using a boundary or empty actions or
-                    // whatever).
-                    is_terminal = false;
-                    continue;
+                let next_depth = NonZeroUsize::new(max_depth.get() + 1).unwrap();
+                match generated.entry(next_fingerprint) {
+                    Entry::Vacant(next_entry) => {
+                        next_entry.insert(next_depth);
+                    }
+                    // Threads do not move through the levels in lockstep, so a
+                    // state can first arrive by a path longer than its shortest
+                    // one. Under a depth limit that would cut off states within
+                    // the limit, so a shorter arrival expands the state again.
+                    Entry::Occupied(mut next_entry)
+                        if target_max_depth.is_some() && next_depth < *next_entry.get() =>
+                    {
+                        next_entry.insert(next_depth);
+                    }
+                    _ => {
+                        // FIXME: arriving at an already-known state may be a loop (in which case it
+                        // could, in a fancier implementation, be considered a terminal state for
+                        // purposes of eventually-property checking) but it might also be a join in
+                        // a DAG, which makes it non-terminal. These cases can be disambiguated (at
+                        // some cost), but for now we just _don't_ treat them as terminal, and tell
+                        // users they need to explicitly ensure model path-acyclicality when they're
+                        // using eventually properties (using a boundary or empty actions or
+                        // whatever).
+                        is_terminal = false;
+                        continue;
+                    }
                 }
 
                 // Otherwise further checking is applicable.
                 is_terminal = false;
-                pending.push_front((
-                    next_state,
-                    next_fingerprint,
-                    ebits.clone(),
-                    NonZeroUsize::new(max_depth.get() + 1).unwrap(),
-                    next_action_path,
-                ));
+                pending.push_front((next_state, ebits.clone(), next_depth, next_action_path));
             }
             if is_terminal {
                 for (i, property) in properties.iter().enumerate() {
                     if ebits.contains(i) {
-                        // Races other threads, but that's fine.
                         discoveries.insert(property.name, action_path.clone());
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Records an `always` or `sometimes` discovery unless one with a path at most
+/// as long is already recorded, so the run reports the shortest path it found.
+fn record_discovery(
+    discoveries: &DashMap<&'static str, Vec<usize>>,
+    name: &'static str,
+    path: &[usize],
+) {
+    match discoveries.entry(name) {
+        Entry::Vacant(entry) => {
+            entry.insert(path.to_vec());
+        }
+        Entry::Occupied(mut entry) => {
+            if path.len() < entry.get().len() {
+                entry.insert(path.to_vec());
             }
         }
     }
@@ -390,7 +407,7 @@ where
             .iter()
             .map(|mapref| {
                 (
-                    <&'static str>::clone(mapref.key()),
+                    *mapref.key(),
                     Path::from_action_indices(self.model(), VecDeque::from(mapref.value().clone())),
                 )
             })
@@ -471,6 +488,77 @@ mod test {
             // (2*0 + 10*27) % 256 == 14
             vec![Guess::IncreaseY; 27],
         );
+    }
+
+    /// Counts up from zero, by one or by two, in three independent counters.
+    /// Most states are reachable by paths of several lengths.
+    /// The flag turns on a property that fails once the first counter reaches 2.
+    struct Steps(bool);
+
+    impl Model for Steps {
+        type State = [u8; 3];
+        type Action = (usize, u8);
+
+        fn init_states(&self) -> Vec<Self::State> {
+            vec![[0, 0, 0]]
+        }
+
+        fn actions(&self, _state: &Self::State, actions: &mut Vec<Self::Action>) {
+            for i in 0..3 {
+                actions.push((i, 1));
+                actions.push((i, 2));
+            }
+        }
+
+        fn next_state(&self, state: &Self::State, (i, n): Self::Action) -> Option<Self::State> {
+            let mut next = *state;
+            next[i] = next[i].checked_add(n)?;
+            Some(next)
+        }
+
+        fn properties(&self) -> Vec<Property<Self>> {
+            if self.0 {
+                vec![Property::always("below 2", |_, s: &[u8; 3]| s[0] < 2)]
+            } else {
+                // The checker stops once every property has a discovery, so
+                // a property that never has one makes it visit every state.
+                vec![Property::sometimes("unreachable", |_, _| false)]
+            }
+        }
+    }
+
+    #[test]
+    fn checks_properties_of_states_at_the_depth_limit() {
+        // [2, 0, 0] is one action away from the initial state, so a depth limit
+        // of 2 generates it, and the checker must check it.
+        let checker = Steps(true).checker().target_max_depth(2).spawn_bfs().join();
+        assert_eq!(checker.unique_state_count(), 7);
+        assert!(checker.discovery("below 2").is_some());
+    }
+
+    #[test]
+    fn depth_limit_is_exact_with_many_threads() {
+        // Every state within 20 actions of the start. A counter at value v
+        // needs ceil(v / 2) actions on its shortest path.
+        let mut expected = 0;
+        for a in 0u32..=40 {
+            for b in 0u32..=40 {
+                for c in 0u32..=40 {
+                    if a.div_ceil(2) + b.div_ceil(2) + c.div_ceil(2) <= 20 {
+                        expected += 1;
+                    }
+                }
+            }
+        }
+        for _ in 0..20 {
+            let checker = Steps(false)
+                .checker()
+                .target_max_depth(21)
+                .threads(8)
+                .spawn_bfs()
+                .join();
+            assert_eq!(checker.unique_state_count(), expected);
+        }
     }
 
     // test that the checker shuts down all threads properly after a checker thread encounters a

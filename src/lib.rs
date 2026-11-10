@@ -144,6 +144,7 @@ use std::hash::{Hash, Hasher};
 mod test_util;
 
 pub mod actor;
+pub mod declarative;
 pub use checker::*;
 pub use has_discoveries::HasDiscoveries;
 pub mod semantics;

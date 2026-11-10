@@ -1,7 +1,7 @@
 use crate::*;
 use parking_lot::RwLock;
-use serde::ser::{SerializeStruct, Serializer};
 use serde::Serialize;
+use serde::ser::{SerializeStruct, Serializer};
 use std::collections::VecDeque;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
@@ -112,9 +112,11 @@ where
     let snapshot = Arc::new(RwLock::new(Snapshot(true, None)));
     let snapshot_for_visitor = Arc::clone(&snapshot);
     let snapshot_for_server = Arc::clone(&snapshot);
-    spawn(move || loop {
-        sleep(Duration::from_secs(4));
-        snapshot.write().0 = true;
+    spawn(move || {
+        loop {
+            sleep(Duration::from_secs(4));
+            snapshot.write().0 = true;
+        }
     });
     let checker = checker_builder
         .visitor(snapshot_for_visitor)
@@ -153,37 +155,39 @@ where
     }
 
     let data = Arc::new((snapshot, Arc::clone(&checker)));
-    let web_handle = std::thread::spawn(move || loop {
-        let rq = server.recv().unwrap();
-        let response = match (rq.method(), rq.url()) {
-            (Method::Get, "/") => get_ui_file!("index.htm"),
-            (Method::Get, "/app.css") => get_ui_file!("app.css"),
-            (Method::Get, "/app.js") => get_ui_file!("app.js"),
-            (Method::Get, "/knockout-3.5.0.js") => get_ui_file!("knockout-3.5.0.js"),
-            (Method::Get, "/.status") => {
-                let view = status(Arc::clone(&data));
-                let status_json = serde_json::to_vec(&view).unwrap();
-                Response::from_data(status_json).boxed()
-            }
-            (Method::Post, "/.runtocompletion") => run_to_completion(Arc::clone(&data)),
-            (Method::Get, url) => {
-                if let Some(fingerprints) = url.strip_prefix("/.states") {
-                    match states(fingerprints, Arc::clone(&data)) {
-                        Ok(states) => {
-                            let states_json = serde_json::to_vec(&states).unwrap();
-                            Response::from_data(states_json).boxed()
-                        }
-                        Err(err) => Response::from_string(err)
-                            .with_status_code(StatusCode(404))
-                            .boxed(),
-                    }
-                } else {
-                    Response::empty(StatusCode(404)).boxed()
+    let web_handle = std::thread::spawn(move || {
+        loop {
+            let rq = server.recv().unwrap();
+            let response = match (rq.method(), rq.url()) {
+                (Method::Get, "/") => get_ui_file!("index.htm"),
+                (Method::Get, "/app.css") => get_ui_file!("app.css"),
+                (Method::Get, "/app.js") => get_ui_file!("app.js"),
+                (Method::Get, "/knockout-3.5.0.js") => get_ui_file!("knockout-3.5.0.js"),
+                (Method::Get, "/.status") => {
+                    let view = status(Arc::clone(&data));
+                    let status_json = serde_json::to_vec(&view).unwrap();
+                    Response::from_data(status_json).boxed()
                 }
-            }
-            _ => Response::empty(StatusCode(404)).boxed(),
-        };
-        rq.respond(response).unwrap();
+                (Method::Post, "/.runtocompletion") => run_to_completion(Arc::clone(&data)),
+                (Method::Get, url) => {
+                    if let Some(fingerprints) = url.strip_prefix("/.states") {
+                        match states(fingerprints, Arc::clone(&data)) {
+                            Ok(states) => {
+                                let states_json = serde_json::to_vec(&states).unwrap();
+                                Response::from_data(states_json).boxed()
+                            }
+                            Err(err) => Response::from_string(err)
+                                .with_status_code(StatusCode(404))
+                                .boxed(),
+                        }
+                    } else {
+                        Response::empty(StatusCode(404)).boxed()
+                    }
+                }
+                _ => Response::empty(StatusCode(404)).boxed(),
+            };
+            rq.respond(response).unwrap();
+        }
     });
     web_handle.join().unwrap();
 
@@ -291,55 +295,60 @@ where
                 action_index: Some(init_index),
             });
         }
-    } else if let Some(last_state) = Path::final_state::<M>(model, indices.clone()) {
-        // Must generate the actions three times because they are consumed by `next_state`
-        // and `display_outcome`.
-        let mut actions1 = Vec::new();
-        let mut actions2 = Vec::new();
-        let mut actions3 = Vec::new();
-        model.actions(&last_state, &mut actions1);
-        model.actions(&last_state, &mut actions2);
-        model.actions(&last_state, &mut actions3);
-        for (action_index, ((action, action2), action3)) in
-            actions1.into_iter().zip(actions2).zip(actions3).enumerate()
-        {
-            let outcome = model.format_step(&last_state, action2);
-            let state = model.next_state(&last_state, action3);
-            log::debug!(
-                "explorer generated state transition: {} -> {}",
-                fingerprint(&last_state),
-                fingerprint(&state)
-            );
-            if let Some(state) = state {
-                let svg = {
-                    let mut indices: VecDeque<_> = indices.clone().into_iter().collect();
-                    indices.push_back(action_index);
-                    model.as_svg(Path::from_action_indices::<M>(model, indices))
-                };
-                results.push(StateView {
-                    action: Some(model.format_action(&action)),
-                    outcome,
-                    state: Some(state),
-                    properties: get_properties(checker),
-                    svg,
-                    action_index: Some(action_index),
-                });
-            } else {
-                // "Action ignored" case is still returned, as it may be useful for debugging.
-                results.push(StateView {
-                    action: Some(model.format_action(&action)),
-                    outcome: None,
-                    state: None,
-                    properties: get_properties(checker),
-                    svg: None,
-                    action_index: Some(action_index),
-                });
+    } else {
+        match Path::final_state::<M>(model, indices.clone()) {
+            Some(last_state) => {
+                // Must generate the actions three times because they are consumed by `next_state`
+                // and `display_outcome`.
+                let mut actions1 = Vec::new();
+                let mut actions2 = Vec::new();
+                let mut actions3 = Vec::new();
+                model.actions(&last_state, &mut actions1);
+                model.actions(&last_state, &mut actions2);
+                model.actions(&last_state, &mut actions3);
+                for (action_index, ((action, action2), action3)) in
+                    actions1.into_iter().zip(actions2).zip(actions3).enumerate()
+                {
+                    let outcome = model.format_step(&last_state, action2);
+                    let state = model.next_state(&last_state, action3);
+                    log::debug!(
+                        "explorer generated state transition: {} -> {}",
+                        fingerprint(&last_state),
+                        fingerprint(&state)
+                    );
+                    if let Some(state) = state {
+                        let svg = {
+                            let mut indices: VecDeque<_> = indices.clone().into_iter().collect();
+                            indices.push_back(action_index);
+                            model.as_svg(Path::from_action_indices::<M>(model, indices))
+                        };
+                        results.push(StateView {
+                            action: Some(model.format_action(&action)),
+                            outcome,
+                            state: Some(state),
+                            properties: get_properties(checker),
+                            svg,
+                            action_index: Some(action_index),
+                        });
+                    } else {
+                        // "Action ignored" case is still returned, as it may be useful for debugging.
+                        results.push(StateView {
+                            action: Some(model.format_action(&action)),
+                            outcome: None,
+                            state: None,
+                            properties: get_properties(checker),
+                            svg: None,
+                            action_index: Some(action_index),
+                        });
+                    }
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "Unable to find state following action indices {indices_str}"
+                ));
             }
         }
-    } else {
-        return Err(format!(
-            "Unable to find state following action indices {indices_str}"
-        ));
     }
 
     Ok(results)
@@ -397,17 +406,11 @@ mod test {
     fn err_for_invalid_index() {
         let checker = Arc::new(BinaryClock.checker().spawn_bfs().join());
         assert_eq!(
-            format!(
-                "{}",
-                get_states(Arc::clone(&checker), "/one/two/three").unwrap_err()
-            ),
+            get_states(Arc::clone(&checker), "/one/two/three").unwrap_err(),
             "Unable to parse action indices /one/two/three"
         );
         assert_eq!(
-            format!(
-                "{}",
-                get_states(Arc::clone(&checker), "/1/2/3").unwrap_err()
-            ),
+            get_states(Arc::clone(&checker), "/1/2/3").unwrap_err(),
             "Unable to find state following action indices /1/2/3"
         );
     }
@@ -448,7 +451,7 @@ mod test {
                     }),
                     properties: vec![
                         (Expectation::Always, "delta within 1".into(), None),
-                        (Expectation::Sometimes, "can reach max".into(), Some("0/1/1/1/1/0".into())),
+                        (Expectation::Sometimes, "can reach max".into(), Some("0/1/1/1".into())),
                         (Expectation::Eventually, "must reach max".into(), Some("0/1/1/0".into())),
                         (Expectation::Eventually, "must exceed max".into(), Some("0/1/1/1/1/0".into())),
                         (Expectation::Always, "#in <= #out".into(), None),
@@ -476,7 +479,7 @@ mod test {
                 }),
                 properties: vec![
                     (Expectation::Always, "delta within 1".into(), None),
-                    (Expectation::Sometimes, "can reach max".into(), Some("0/1/1/1/1/0".into())),
+                    (Expectation::Sometimes, "can reach max".into(), Some("0/1/1/1".into())),
                     (Expectation::Eventually, "must reach max".into(), Some("0/1/1/0".into())),
                     (Expectation::Eventually, "must exceed max".into(), Some("0/1/1/1/1/0".into())),
                     (Expectation::Always, "#in <= #out".into(), None),
@@ -506,7 +509,7 @@ mod test {
                 }),
                 properties: vec![
                     (Expectation::Always, "delta within 1".into(), None),
-                    (Expectation::Sometimes, "can reach max".into(), Some("0/1/1/1/1/0".into())),
+                    (Expectation::Sometimes, "can reach max".into(), Some("0/1/1/1".into())),
                     (Expectation::Eventually, "must reach max".into(), Some("0/1/1/0".into())),
                     (Expectation::Eventually, "must exceed max".into(), Some("0/1/1/1/1/0".into())),
                     (Expectation::Always, "#in <= #out".into(), None),

@@ -15,8 +15,8 @@ use crate::actor::Id;
 use crate::util::{HashableHashMap, HashableHashSet};
 use crate::{Rewrite, RewritePlan};
 use std::collections::btree_map::Entry;
-use std::collections::{btree_map, hash_map, hash_set};
 use std::collections::{BTreeMap, VecDeque};
+use std::collections::{btree_map, hash_map, hash_set};
 use std::hash::Hash;
 use std::str::FromStr;
 
@@ -166,7 +166,7 @@ where
     }
 
     /// Returns an iterator over all envelopes in the network.
-    pub fn iter_all(&self) -> NetworkIter<Msg> {
+    pub fn iter_all(&self) -> NetworkIter<'_, Msg> {
         match self {
             Network::UnorderedDuplicating(set, _) => NetworkIter::UnorderedDuplicating(set.iter()),
             Network::UnorderedNonDuplicating(multiset) => {
@@ -177,7 +177,7 @@ where
     }
 
     /// Returns an iterator over all distinct deliverable envelopes in the network.
-    pub fn iter_deliverable(&self) -> NetworkDeliverableIter<Msg> {
+    pub fn iter_deliverable(&self) -> NetworkDeliverableIter<'_, Msg> {
         match self {
             Network::UnorderedDuplicating(set, _) => {
                 NetworkDeliverableIter::UnorderedDuplicating(set.iter())
