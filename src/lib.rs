@@ -372,6 +372,7 @@ impl Model for () {
 // Helpers for stable hashing, wherein hashes should not vary across builds.
 mod stable {
     use std::hash::BuildHasher;
+    use std::sync::LazyLock;
 
     use ahash::{AHasher, RandomState};
 
@@ -382,7 +383,10 @@ mod stable {
     const KEY4: u64 = 0;
 
     pub(crate) fn hasher() -> AHasher {
-        build_hasher().build_hasher()
+        // Deriving the hasher's keys from the seeds takes longer than
+        // hashing a small state, so the derived keys are computed once.
+        static STATE: LazyLock<RandomState> = LazyLock::new(build_hasher);
+        STATE.build_hasher()
     }
 
     pub(crate) fn build_hasher() -> RandomState {
