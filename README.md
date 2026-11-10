@@ -200,10 +200,18 @@ counts match (4,756, 15,965, 3,752,047 and 7,585,107 states), and for each
 seeded bug the counterexample matches step for step.
 
 The JSON route is slower than a model written in Rust. On the
-3,752,047-state configuration on an 18-core laptop, it took 8.3 s on one
-thread and 2.1 s on 8, against 0.6 s on 8 threads for the same model
+3,752,047-state configuration on an 18-core laptop, it took 8.2 s on one
+thread and 1.9 s on 8, against 0.6 s on 8 threads for the same model
 written as a Rust `Model`. A breadth-first search in Python took 11.5 s on
 one core.
+
+The checker works out which state fields each action reads. An action does
+the same thing in every state that agrees on those fields, so each thread
+remembers the steps an action offered and repeats them when the values come
+back. An action that reads a few fields of a large state then costs a table
+lookup in most states. The table has 65,536 entries per thread, and a new
+entry replaces the one in its slot. An action that reads most of the state
+rarely finds its values again, and the checker stops looking them up for it.
 
 ## Getting Started
 
