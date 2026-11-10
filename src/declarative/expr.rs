@@ -1112,23 +1112,14 @@ impl<'a> Ctx<'a> {
                 }
                 Value::Int(acc)
             }
-            Expr::IndexOf(l, x) => {
-                let x = self.eval(x, state, base)?;
-                match self.eval(l, state, base)? {
-                    Value::List(l) => match l.iter().position(|v| *v == x) {
-                        Some(i) => Value::Int(i as i64),
-                        None => Value::Null,
-                    },
-                    v => return type_error(self, "index_of", &v),
-                }
-            }
-            Expr::In(x, l) => {
-                let x = self.eval(x, state, base)?;
-                match self.eval(l, state, base)? {
-                    Value::List(l) => Value::Bool(l.contains(&x)),
-                    v => return type_error(self, "in", &v),
-                }
-            }
+            Expr::IndexOf(l, x) => self.pair(x, l, state, base, |ctx, x, l| match l {
+                Value::List(l) => Ok(match l.iter().position(|v| same(v, x)) {
+                    Some(i) => Value::Int(i as i64),
+                    None => Value::Null,
+                }),
+                v => type_error(ctx, "index_of", v),
+            })?,
+            Expr::In(..) => Value::Bool(self.truth(e, state, base, "in")?),
             Expr::Range(a, b) => {
                 let (a, b) = (
                     self.int(a, state, base, "range")?,
@@ -1400,6 +1391,12 @@ impl<'a> Ctx<'a> {
                 self.peek(l, state, base)?,
                 self.peek(r, state, base)?,
             )),
+            Expr::Cmp(ord, negate, l, r) if simple(l) && simple(r) => {
+                match (self.peek(l, state, base)?, self.peek(r, state, base)?) {
+                    (Value::Int(a), Value::Int(b)) => Ok((a.cmp(b) == *ord) != *negate),
+                    _ => self.truth(e, state, base, what),
+                }
+            }
             _ => self.truth(e, state, base, what),
         }
     }
@@ -1429,11 +1426,15 @@ impl<'a> Ctx<'a> {
                 Ok(false)
             }
             Expr::Not(x) => Ok(!self.test(x, state, base, "not")?),
-            Expr::Eq(l, r) => self.compare(l, r, state, base, |a, b| Ok(same(a, b))),
-            Expr::Ne(l, r) => self.compare(l, r, state, base, |a, b| Ok(!same(a, b))),
+            Expr::Eq(l, r) => self.pair(l, r, state, base, |_, a, b| Ok(same(a, b))),
+            Expr::Ne(l, r) => self.pair(l, r, state, base, |_, a, b| Ok(!same(a, b))),
+            Expr::In(x, l) => self.pair(x, l, state, base, |ctx, x, l| match l {
+                Value::List(l) => Ok(l.iter().any(|v| same(v, x))),
+                v => type_error(ctx, "in", v),
+            }),
             Expr::Cmp(ord, negate, l, r) => {
                 let symbols = self.symbols;
-                self.compare(l, r, state, base, |a, b| {
+                self.pair(l, r, state, base, |_, a, b| {
                     let order = match (a, b) {
                         (Value::Int(a), Value::Int(b)) => a.cmp(b),
                         _ if std::mem::discriminant(a) != std::mem::discriminant(b) => {
@@ -1464,26 +1465,31 @@ impl<'a> Ctx<'a> {
     }
 
     /// Applies `f` to two operands, reading simple ones in place.
-    fn compare(
+    #[inline(always)]
+    fn pair<R>(
         &mut self,
         l: &Expr,
         r: &Expr,
         state: &[Value],
         base: usize,
-        f: impl FnOnce(&Value, &Value) -> EvalResult<bool>,
-    ) -> EvalResult<bool> {
+        f: impl FnOnce(&Self, &Value, &Value) -> EvalResult<R>,
+    ) -> EvalResult<R> {
         if simple(l) && simple(r) {
-            return f(self.peek(l, state, base)?, self.peek(r, state, base)?);
+            return f(
+                self,
+                self.peek(l, state, base)?,
+                self.peek(r, state, base)?,
+            );
         }
         let lo = if simple(l) {
             None
         } else {
-            Some(self.eval(l, state, base)?)
+            Some(self.compute(l, state, base)?)
         };
         let ro = if simple(r) {
             None
         } else {
-            Some(self.eval(r, state, base)?)
+            Some(self.compute(r, state, base)?)
         };
         let lv = match &lo {
             Some(v) => v,
@@ -1493,7 +1499,7 @@ impl<'a> Ctx<'a> {
             Some(v) => v,
             None => self.peek(r, state, base)?,
         };
-        f(lv, rv)
+        f(self, lv, rv)
     }
 
     /// Reads a [`simple`] expression in place.
