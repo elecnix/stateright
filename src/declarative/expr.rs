@@ -1096,22 +1096,7 @@ impl<'a> Ctx<'a> {
             | Expr::Ne(..)
             | Expr::Cmp(..)
             | Expr::InLit(..) => Value::Bool(self.truth(e, state, base, "a condition")?),
-            Expr::Arith(op, items) => {
-                let mut acc = self.int(&items[0], state, base, "arithmetic")?;
-                for item in &items[1..] {
-                    let x = self.int(item, state, base, "arithmetic")?;
-                    acc = match op {
-                        Arith::Add => acc.checked_add(x).ok_or("integer overflow")?,
-                        Arith::Sub => acc.checked_sub(x).ok_or("integer overflow")?,
-                        Arith::Mul => acc.checked_mul(x).ok_or("integer overflow")?,
-                        Arith::Div => floor_div(acc, x)?.0,
-                        Arith::Mod => floor_div(acc, x)?.1,
-                        Arith::Min => acc.min(x),
-                        Arith::Max => acc.max(x),
-                    };
-                }
-                Value::Int(acc)
-            }
+            Expr::Arith(op, items) => Value::Int(self.arith(*op, items, state, base)?),
             Expr::IndexOf(l, x) => self.pair(x, l, state, base, |ctx, x, l| match l {
                 Value::List(l) => Ok(match l.iter().position(|v| same(v, x)) {
                     Some(i) => Value::Int(i as i64),
@@ -1239,21 +1224,51 @@ impl<'a> Ctx<'a> {
                 if let Some(v) = &self.memo[*def] {
                     return Ok(v.clone());
                 }
-                let v = self.call(*def, args, state, base)?;
+                let v = self.call(*def, args, state, base, |ctx, body, base| {
+                    ctx.eval(body, state, base)
+                })?;
                 self.memo[*def] = Some(v.clone());
                 v
             }
-            Expr::Call(def, args) => self.call(*def, args, state, base)?,
+            Expr::Call(def, args) => self.call(*def, args, state, base, |ctx, body, base| {
+                ctx.eval(body, state, base)
+            })?,
         })
     }
 
-    fn call(
+    fn arith(
+        &mut self,
+        op: Arith,
+        items: &[Expr],
+        state: &[Value],
+        base: usize,
+    ) -> EvalResult<i64> {
+        let mut acc = self.int(&items[0], state, base, "arithmetic")?;
+        for item in &items[1..] {
+            let x = self.int(item, state, base, "arithmetic")?;
+            acc = match op {
+                Arith::Add => acc.checked_add(x).ok_or("integer overflow")?,
+                Arith::Sub => acc.checked_sub(x).ok_or("integer overflow")?,
+                Arith::Mul => acc.checked_mul(x).ok_or("integer overflow")?,
+                Arith::Div => floor_div(acc, x)?.0,
+                Arith::Mod => floor_div(acc, x)?.1,
+                Arith::Min => acc.min(x),
+                Arith::Max => acc.max(x),
+            };
+        }
+        Ok(acc)
+    }
+
+    /// Calls a def: evaluates the arguments into a new frame, then hands
+    /// the def's body and the frame's base to `evaluate`.
+    fn call<R>(
         &mut self,
         def: usize,
         args: &[Expr],
         state: &[Value],
         base: usize,
-    ) -> EvalResult<Value> {
+        evaluate: impl FnOnce(&mut Self, &Expr, usize) -> EvalResult<R>,
+    ) -> EvalResult<R> {
         let def_ref = &self.defs[def];
         if args.len() != def_ref.arity {
             return Err(EvalError::from(format!(
@@ -1276,7 +1291,7 @@ impl<'a> Ctx<'a> {
         }
         self.stack.resize(new_base + frame, Value::Null);
         let defs = self.defs;
-        let result = self.eval(&defs[def].body, state, new_base);
+        let result = evaluate(self, &defs[def].body, new_base);
         self.stack.truncate(new_base);
         result
     }
@@ -1297,6 +1312,7 @@ impl<'a> Ctx<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
     fn iter(
         &mut self,
         op: IterOp,
@@ -1454,6 +1470,30 @@ impl<'a> Ctx<'a> {
                 }
             }
             Expr::Lit(Value::Bool(b)) => Ok(*b),
+            // A condition inside an `if`, a `let` or a def answers as a
+            // condition all the way down, without a value in between.
+            Expr::If(items) => {
+                let mut i = 0;
+                while i + 1 < items.len() {
+                    if self.test(&items[i], state, base, "if")? {
+                        return self.test(&items[i + 1], state, base, what);
+                    }
+                    i += 2;
+                }
+                self.test(&items[items.len() - 1], state, base, what)
+            }
+            Expr::Let(bindings, body) => {
+                for (slot, value) in bindings {
+                    let v = self.eval(value, state, base)?;
+                    self.stack[base + slot] = v;
+                }
+                self.test(body, state, base, what)
+            }
+            Expr::Call(def, args) if !args.is_empty() || self.memo.is_empty() => {
+                self.call(*def, args, state, base, |ctx, body, base| {
+                    ctx.test(body, state, base, what)
+                })
+            }
             _ => {
                 let v = self.eval(e, state, base)?;
                 match v.as_bool() {
@@ -1538,13 +1578,24 @@ impl<'a> Ctx<'a> {
         Ok(cur)
     }
 
+    /// Evaluates an integer. Stored values, lengths and arithmetic answer
+    /// here, without a value in between.
     fn int(&mut self, e: &Expr, state: &[Value], base: usize, what: &str) -> EvalResult<i64> {
         let held;
-        let v = if simple(e) {
-            self.peek(e, state, base)?
-        } else {
-            held = self.eval(e, state, base)?;
-            &held
+        let v = match e {
+            Expr::Arith(op, items) => return self.arith(*op, items, state, base),
+            Expr::Len(x) if simple(x) => {
+                return match self.peek(x, state, base)? {
+                    Value::List(l) => Ok(l.len() as i64),
+                    Value::Rec(r) => Ok(r.len() as i64),
+                    v => type_error(self, "len", v),
+                };
+            }
+            _ if simple(e) => self.peek(e, state, base)?,
+            _ => {
+                held = self.compute(e, state, base)?;
+                &held
+            }
         };
         match v.as_int() {
             Some(i) => Ok(i),
