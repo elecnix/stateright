@@ -28,6 +28,9 @@
   fingerprint derived them again.
 - The review workflow passes the model endpoint to Cite as inputs. Passed
   as environment variables, the action replaced them with its defaults.
+- New `mimalloc` feature: the `stateright` binary allocates with mimalloc.
+  The released binaries are built with it. The Linux one links musl, whose
+  allocator made four checker threads slower than one.
 - Edition 2024, `rust-version = "1.88"`.
 
 ## 0.31.0

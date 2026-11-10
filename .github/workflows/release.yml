@@ -28,7 +28,7 @@ jobs:
           targets: ${{ matrix.target }}
       - if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: cargo build --release --locked --bin stateright --target ${{ matrix.target }}
+      - run: cargo build --release --locked --bin stateright --features mimalloc --target ${{ matrix.target }}
         env:
           CARGO_PROFILE_RELEASE_LTO: thin
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
