@@ -201,7 +201,7 @@ seeded bug the counterexample matches step for step.
 
 The JSON route is slower than a model written in Rust. On the
 3,752,047-state configuration on an 18-core laptop, it took 8.3 s on one
-thread and about 1.3 s on 8, against 0.6 s on 8 threads for the same model
+thread and 2.1 s on 8, against 0.6 s on 8 threads for the same model
 written as a Rust `Model`. A breadth-first search in Python took 11.5 s on
 one core.
 
