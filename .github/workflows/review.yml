@@ -19,7 +19,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: elecnix/cite@1460a96b67ac425466c7bde99597d1e312ee8408 # v0.16.1
-        env:
-          MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
-          MODEL_BASE_URL: ${{ secrets.MODEL_BASE_URL }}
-          MODEL_ID: ${{ secrets.MODEL_ID }}
+        # The action reads its hosted model endpoint from inputs. It sets
+        # its own environment from them, so values passed as `env` here
+        # would be replaced by the empty defaults.
+        with:
+          model_api_key: ${{ secrets.MODEL_API_KEY }}
+          model_base_url: ${{ secrets.MODEL_BASE_URL }}
+          model_id: ${{ secrets.MODEL_ID }}
