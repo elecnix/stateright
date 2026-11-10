@@ -79,3 +79,8 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo build --release --bin stateright
       - run: python3 py/conformance.py target/release/stateright --large
+      - name: Time the largest model on every core
+        run: |
+          python3 py/examples/required_checks.py emit 3 2 1 2 1 correct > large.json
+          nproc
+          target/release/stateright check --threads "$(nproc)" large.json > /dev/null

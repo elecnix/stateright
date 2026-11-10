@@ -109,6 +109,7 @@ equal.
 | `let` | Names bound in order, before the guard: `[["name", expression], ...]`. |
 | `guard` | A boolean expression. The action is enabled when it is true. |
 | `effects` | Updates, applied in order. Each effect sees the state as the effects before it left it. |
+| `normalize` | Optional, `true` by default. Set it to `false` when the action keeps a normalized state normalized, and the model's `normalize` effects are skipped after it. The checker doesn't verify this claim. |
 
 Effects:
 
@@ -198,9 +199,10 @@ plain Python breadth-first search of the same system. The distinct state
 counts match (4,756, 15,965, 3,752,047 and 7,585,107 states), and for each
 seeded bug the counterexample matches step for step.
 
-The JSON route is slower than a model written in Rust. On the 3,752,047-state
-configuration with 8 threads, it took 1.5 to 2.6 s, against 0.6 s for the
-same model as a Rust `Model`. A breadth-first search in Python took 11.5 s on
+The JSON route is slower than a model written in Rust. On the
+3,752,047-state configuration on an 18-core laptop, it took 8.3 s on one
+thread and about 1.3 s on 8, against 0.6 s on 8 threads for the same model
+written as a Rust `Model`. A breadth-first search in Python took 11.5 s on
 one core.
 
 ## Getting Started
