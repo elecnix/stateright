@@ -3,6 +3,7 @@
 use super::value::{Hashed, Show, Sym, Symbols, Value};
 use std::cmp::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
 /// A compiled expression. Names are resolved at compile time: a state field
 /// to its slot in the state, a local name to its slot in the current frame.
@@ -16,7 +17,7 @@ pub(crate) enum Expr {
     Get(Box<Expr>, Box<Expr>, Option<Box<Expr>>),
     /// `get` chains on a state field or a local, read by reference so the
     /// lists and records along the way are not copied.
-    Path(Root, Vec<Expr>),
+    Path(Root, Vec<Expr>, Hints),
     Len(Box<Expr>),
     If(Vec<Expr>),
     And(Vec<Expr>),
@@ -41,10 +42,36 @@ pub(crate) enum Expr {
         op: IterOp,
         list: Box<Expr>,
         slot: usize,
+        /// Whether the body can read the index, in the slot after `slot`.
+        indexed: bool,
         body: Box<Expr>,
     },
     Let(Vec<(usize, Expr)>, Box<Expr>),
     Call(usize, Vec<Expr>),
+}
+
+/// What compilation and earlier evaluations learned about a [`Expr::Path`].
+#[derive(Debug, Default)]
+pub(crate) struct Hints {
+    /// Whether every key is a literal or a local, so the path can be read
+    /// in place. See [`simple`].
+    simple: bool,
+    /// For each key, the position where a record last had it. Records built
+    /// by the same expression have the same fields, so the position is
+    /// usually right and saves the search. Threads may race to store it,
+    /// and a stale position only costs the search.
+    found: Vec<AtomicU32>,
+}
+
+impl Hints {
+    fn of(keys: &[Expr]) -> Hints {
+        Hints {
+            simple: keys
+                .iter()
+                .all(|k| matches!(k, Expr::Lit(_) | Expr::Local(_))),
+            found: keys.iter().map(|_| AtomicU32::new(0)).collect(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -356,11 +383,11 @@ pub(crate) fn compile(scope: &mut Scope, json: &Json, at: &str) -> Result<Expr, 
             let x = compile(scope, &a[0], at)?;
             let k = compile(scope, &a[1], at)?;
             match (x, a.get(2)) {
-                (Expr::Field(f), None) => Expr::Path(Root::Field(f), vec![k]),
-                (Expr::Local(l), None) => Expr::Path(Root::Local(l), vec![k]),
-                (Expr::Path(root, mut keys), None) => {
+                (Expr::Field(f), None) => path(Root::Field(f), vec![k]),
+                (Expr::Local(l), None) => path(Root::Local(l), vec![k]),
+                (Expr::Path(root, mut keys, _), None) => {
                     keys.push(k);
-                    Expr::Path(root, keys)
+                    path(root, keys)
                 }
                 (x, default) => Expr::Get(
                     Box::new(x),
@@ -467,6 +494,7 @@ pub(crate) fn compile(scope: &mut Scope, json: &Json, at: &str) -> Result<Expr, 
             let (x, i) = binder(&a[1], at)?;
             let mark = scope.mark();
             let slot = scope.bind(&x);
+            let indexed = i.is_some();
             match i {
                 Some(i) => {
                     scope.bind(&i);
@@ -481,6 +509,7 @@ pub(crate) fn compile(scope: &mut Scope, json: &Json, at: &str) -> Result<Expr, 
                 op: iter,
                 list,
                 slot,
+                indexed,
                 body,
             }
         }
@@ -519,36 +548,73 @@ pub(crate) fn compile(scope: &mut Scope, json: &Json, at: &str) -> Result<Expr, 
     Ok(e)
 }
 
-/// Reads one key of a list or a record by reference.
-fn step<'v>(symbols: &Symbols, cur: &'v Value, key: &Value) -> EvalResult<&'v Value> {
-    let next = match (cur, key) {
+fn path(root: Root, keys: Vec<Expr>) -> Expr {
+    let hints = Hints::of(&keys);
+    Expr::Path(root, keys, hints)
+}
+
+/// Reads one key of a list or a record by reference. `found` is the
+/// position where a record last had the key at this place in the model.
+#[inline(always)]
+fn step<'v>(
+    symbols: &Symbols,
+    cur: &'v Value,
+    key: &Value,
+    found: &AtomicU32,
+) -> EvalResult<&'v Value> {
+    match (cur, key) {
         (Value::List(l), Value::Int(i)) => {
             let n = l.len() as i64;
             let i = if *i < 0 { n + i } else { *i };
-            (0..n).contains(&i).then(|| &l[i as usize])
+            if (0..n).contains(&i) {
+                return Ok(&l[i as usize]);
+            }
         }
         (Value::Rec(r), Value::Str(s)) => {
-            r.binary_search_by_key(s, |(k, _)| *k).ok().map(|i| &r[i].1)
+            match r.get(found.load(AtomicOrdering::Relaxed) as usize) {
+                Some((k, v)) if k == s => return Ok(v),
+                _ => {
+                    if let Ok(i) = r.binary_search_by_key(s, |(k, _)| *k) {
+                        found.store(i as u32, AtomicOrdering::Relaxed);
+                        return Ok(&r[i].1);
+                    }
+                }
+            }
         }
-        _ => None,
-    };
-    next.ok_or_else(|| {
-        EvalError::from(format!(
-            "get: no {} in {}",
-            Show(symbols, key),
-            Show(symbols, cur)
-        ))
-    })
+        _ => {}
+    }
+    Err(no_key(symbols, cur, key))
+}
+
+#[cold]
+#[inline(never)]
+fn no_key(symbols: &Symbols, cur: &Value, key: &Value) -> EvalError {
+    EvalError::from(format!(
+        "get: no {} in {}",
+        Show(symbols, key),
+        Show(symbols, cur)
+    ))
+}
+
+/// Whether two values are equal. Scalars of the same type compare here,
+/// without a call.
+#[inline(always)]
+fn same(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Int(a), Value::Int(b)) => a == b,
+        (Value::Str(a), Value::Str(b)) => a == b,
+        (Value::Bool(a), Value::Bool(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 /// Whether an expression reads a value already stored: a literal, a state
 /// field, a local, or a path whose keys are literals or locals.
+#[inline]
 fn simple(e: &Expr) -> bool {
     match e {
         Expr::Lit(_) | Expr::Field(_) | Expr::Local(_) => true,
-        Expr::Path(_, keys) => keys
-            .iter()
-            .all(|k| matches!(k, Expr::Lit(_) | Expr::Local(_))),
+        Expr::Path(_, _, hints) => hints.simple,
         _ => false,
     }
 }
@@ -575,7 +641,7 @@ pub(crate) fn binding<'j>(json: &'j Json, at: &str) -> Result<(&'j str, &'j Json
     }
 }
 
-fn path(scope: &mut Scope, json: &Json, at: &str) -> Result<(usize, Vec<Expr>), String> {
+fn target(scope: &mut Scope, json: &Json, at: &str) -> Result<(usize, Vec<Expr>), String> {
     let (field, rest) = match json {
         Json::String(f) => (f.as_str(), &[][..]),
         Json::Array(items) if !items.is_empty() => match &items[0] {
@@ -620,18 +686,18 @@ pub(crate) fn compile_effects(
             return Err(format!("{at}: an effect is an object"));
         };
         let effect = if let Some(p) = fields.get("set") {
-            let (field, path) = path(scope, p, at)?;
+            let (field, path) = target(scope, p, at)?;
             let value = compile(scope, get(fields, "to", at)?, at)?;
             Effect::Set { field, path, value }
         } else if let Some(p) = fields.get("append") {
-            let (field, path) = path(scope, p, at)?;
+            let (field, path) = target(scope, p, at)?;
             let value = compile(scope, get(fields, "value", at)?, at)?;
             Effect::Append { field, path, value }
         } else if let Some(p) = fields.get("clear") {
-            let (field, path) = path(scope, p, at)?;
+            let (field, path) = target(scope, p, at)?;
             Effect::Clear { field, path }
         } else if let Some(p) = fields.get("remove") {
-            let (field, path) = path(scope, p, at)?;
+            let (field, path) = target(scope, p, at)?;
             let at_index = compile(scope, get(fields, "at", at)?, at)?;
             Effect::Remove {
                 field,
@@ -675,6 +741,143 @@ pub(crate) fn compile_effects(
     Ok(out)
 }
 
+/// Calls `f` on each direct subexpression of `e`.
+fn each_child<'e>(e: &'e Expr, f: &mut impl FnMut(&'e Expr)) {
+    match e {
+        Expr::Lit(_) | Expr::Field(_) | Expr::Local(_) => {}
+        Expr::List(items)
+        | Expr::Path(_, items, _)
+        | Expr::If(items)
+        | Expr::And(items)
+        | Expr::Or(items)
+        | Expr::Arith(_, items)
+        | Expr::Concat(items)
+        | Expr::Call(_, items) => items.iter().for_each(f),
+        Expr::Rec(fields) => fields.iter().for_each(|(_, v)| f(v)),
+        Expr::Len(x) | Expr::Not(x) | Expr::InLit(x, _) => f(x),
+        Expr::Eq(a, b)
+        | Expr::Ne(a, b)
+        | Expr::Cmp(_, _, a, b)
+        | Expr::In(a, b)
+        | Expr::IndexOf(a, b)
+        | Expr::Range(a, b)
+        | Expr::SetOp(_, a, b)
+        | Expr::Subset(a, b) => {
+            f(a);
+            f(b);
+        }
+        Expr::Get(a, b, c) | Expr::Slice(a, b, c) => {
+            f(a);
+            f(b);
+            if let Some(c) = c {
+                f(c);
+            }
+        }
+        Expr::SetAt(a, b, c) | Expr::With(a, b, c) => {
+            f(a);
+            f(b);
+            f(c);
+        }
+        Expr::Iter { list, body, .. } => {
+            f(list);
+            f(body);
+        }
+        Expr::Let(bindings, body) => {
+            bindings.iter().for_each(|(_, v)| f(v));
+            f(body);
+        }
+    }
+}
+
+/// The state fields a piece of a model reads and the ones it changes, as
+/// one flag per field. A piece that reads only some fields gives the same
+/// result in every state that agrees on them.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Access {
+    pub(crate) reads: Vec<bool>,
+    pub(crate) writes: Vec<bool>,
+}
+
+impl Access {
+    pub(crate) fn none(fields: usize) -> Access {
+        Access {
+            reads: vec![false; fields],
+            writes: vec![false; fields],
+        }
+    }
+
+    pub(crate) fn merge(&mut self, other: &Access) {
+        for (mine, theirs) in self.reads.iter_mut().zip(&other.reads) {
+            *mine |= theirs;
+        }
+        for (mine, theirs) in self.writes.iter_mut().zip(&other.writes) {
+            *mine |= theirs;
+        }
+    }
+
+    /// Marks the fields `e` reads. `def_reads` gives the fields each def
+    /// reads, the defs it calls included.
+    pub(crate) fn expr(&mut self, e: &Expr, def_reads: &[Vec<bool>]) {
+        match e {
+            Expr::Field(f) | Expr::Path(Root::Field(f), ..) => self.reads[*f] = true,
+            Expr::Call(def, _) => {
+                for (mine, theirs) in self.reads.iter_mut().zip(&def_reads[*def]) {
+                    *mine |= theirs;
+                }
+            }
+            _ => {}
+        }
+        each_child(e, &mut |child| self.expr(child, def_reads));
+    }
+
+    /// Marks the fields `effects` read and change. A field an effect may
+    /// change counts as read too: part of it can stay as it was, and so can
+    /// all of it when the effect is in a branch not taken.
+    pub(crate) fn effects(&mut self, effects: &[Effect], def_reads: &[Vec<bool>]) {
+        for effect in effects {
+            match effect {
+                Effect::Set { field, path, value } | Effect::Append { field, path, value } => {
+                    self.change(*field, path, def_reads);
+                    self.expr(value, def_reads);
+                }
+                Effect::Clear { field, path } => self.change(*field, path, def_reads),
+                Effect::Remove { field, path, at } => {
+                    self.change(*field, path, def_reads);
+                    self.expr(at, def_reads);
+                }
+                Effect::If(cond, then, otherwise) => {
+                    self.expr(cond, def_reads);
+                    self.effects(then, def_reads);
+                    self.effects(otherwise, def_reads);
+                }
+                Effect::Let(_, value) => self.expr(value, def_reads),
+                Effect::Require(cond) => self.expr(cond, def_reads),
+                Effect::Violate(_) => {}
+            }
+        }
+    }
+
+    fn change(&mut self, field: usize, path: &[Expr], def_reads: &[Vec<bool>]) {
+        self.reads[field] = true;
+        self.writes[field] = true;
+        path.iter().for_each(|k| self.expr(k, def_reads));
+    }
+}
+
+/// The fields each def reads, the defs it calls included. Defs do not
+/// recurse, so repeating the pass once per def follows every chain of calls.
+pub(crate) fn def_reads(defs: &[Def], fields: usize) -> Vec<Vec<bool>> {
+    let mut reads = vec![vec![false; fields]; defs.len()];
+    for _ in 0..defs.len() {
+        for (i, def) in defs.iter().enumerate() {
+            let mut access = Access::none(fields);
+            access.expr(&def.body, &reads);
+            reads[i] = access.reads;
+        }
+    }
+    reads
+}
+
 /// Evaluation context: the state the expressions read, the defs, and a stack
 /// of local slots.
 pub(crate) struct Ctx<'a> {
@@ -684,14 +887,37 @@ pub(crate) struct Ctx<'a> {
     /// Values of zero-argument defs for the one state this context reads.
     /// Empty when the context evaluates against a state that effects change.
     pub(crate) memo: Vec<Option<Value>>,
+    /// The keys of the path the current effect changes.
+    keys: Vec<Value>,
 }
 
+/// The allocations of a [`Ctx`], kept between evaluations so that each one
+/// does not allocate its own.
+#[derive(Default)]
+pub(crate) struct Buffers {
+    stack: Vec<Value>,
+    memo: Vec<Option<Value>>,
+    keys: Vec<Value>,
+}
+
+#[cold]
+#[inline(never)]
 fn type_error<T>(ctx: &Ctx, what: &str, v: &Value) -> EvalResult<T> {
     Err(EvalError::from(format!(
         "{what} expects a different type, found {} {}",
         v.type_name(),
         Show(ctx.symbols, v)
     )))
+}
+
+#[cold]
+#[inline(never)]
+fn unordered(symbols: &Symbols, a: &Value, b: &Value) -> EvalError {
+    EvalError::from(format!(
+        "cannot order {} and {}",
+        Show(symbols, a),
+        Show(symbols, b)
+    ))
 }
 
 fn index(ctx: &Ctx, len: usize, i: &Value, what: &str) -> EvalResult<Option<usize>> {
@@ -726,8 +952,60 @@ fn as_set(v: &Value) -> Vec<Value> {
     items
 }
 
-impl Ctx<'_> {
+impl<'a> Ctx<'a> {
+    /// A context with `frame` local slots, and with one memo slot per def
+    /// when `memoize` is set. Set it only to evaluate against one state
+    /// that does not change.
+    pub(crate) fn new(
+        symbols: &'a Symbols,
+        defs: &'a [Def],
+        frame: usize,
+        memoize: bool,
+        buffers: Buffers,
+    ) -> Self {
+        let Buffers {
+            mut stack,
+            mut memo,
+            mut keys,
+        } = buffers;
+        stack.clear();
+        stack.resize(frame, Value::Null);
+        memo.clear();
+        if memoize {
+            memo.resize(defs.len().max(1), None);
+        }
+        keys.clear();
+        Ctx {
+            symbols,
+            defs,
+            stack,
+            memo,
+            keys,
+        }
+    }
+
+    /// Gives the allocations back for the next context.
+    pub(crate) fn into_buffers(self) -> Buffers {
+        Buffers {
+            stack: self.stack,
+            memo: self.memo,
+            keys: self.keys,
+        }
+    }
+
+    /// Evaluates an expression. A value already stored is copied here, and
+    /// every operation goes through [`Ctx::compute`].
+    #[inline(always)]
     pub(crate) fn eval(&mut self, e: &Expr, state: &[Value], base: usize) -> EvalResult<Value> {
+        if simple(e) {
+            Ok(self.peek(e, state, base)?.clone())
+        } else {
+            self.compute(e, state, base)
+        }
+    }
+
+    #[inline(never)]
+    fn compute(&mut self, e: &Expr, state: &[Value], base: usize) -> EvalResult<Value> {
         Ok(match e {
             Expr::Lit(v) => v.clone(),
             Expr::Field(i) => state[*i].clone(),
@@ -769,8 +1047,8 @@ impl Ctx<'_> {
                     }
                 }
             }
-            Expr::Path(root, keys) => {
-                if simple(e) {
+            Expr::Path(root, keys, hints) => {
+                if hints.simple {
                     self.peek(e, state, base)?.clone()
                 } else {
                     let mut evaluated = Vec::with_capacity(keys.len());
@@ -781,21 +1059,30 @@ impl Ctx<'_> {
                         Root::Field(f) => &state[*f],
                         Root::Local(l) => &self.stack[base + l],
                     };
-                    for key in &evaluated {
-                        cur = step(self.symbols, cur, key)?;
+                    for (key, found) in evaluated.iter().zip(&hints.found) {
+                        cur = step(self.symbols, cur, key, found)?;
                     }
                     cur.clone()
                 }
             }
-            Expr::Len(x) => match self.eval(x, state, base)? {
-                Value::List(l) => Value::Int(l.len() as i64),
-                Value::Rec(r) => Value::Int(r.len() as i64),
-                v => return type_error(self, "len", &v),
-            },
+            Expr::Len(x) => {
+                let held;
+                let v = if simple(x) {
+                    self.peek(x, state, base)?
+                } else {
+                    held = self.eval(x, state, base)?;
+                    &held
+                };
+                match v {
+                    Value::List(l) => Value::Int(l.len() as i64),
+                    Value::Rec(r) => Value::Int(r.len() as i64),
+                    v => return type_error(self, "len", v),
+                }
+            }
             Expr::If(items) => {
                 let mut i = 0;
                 while i + 1 < items.len() {
-                    if self.truth(&items[i], state, base, "if")? {
+                    if self.test(&items[i], state, base, "if")? {
                         return self.eval(&items[i + 1], state, base);
                     }
                     i += 2;
@@ -809,39 +1096,15 @@ impl Ctx<'_> {
             | Expr::Ne(..)
             | Expr::Cmp(..)
             | Expr::InLit(..) => Value::Bool(self.truth(e, state, base, "a condition")?),
-            Expr::Arith(op, items) => {
-                let mut acc = self.int(&items[0], state, base, "arithmetic")?;
-                for item in &items[1..] {
-                    let x = self.int(item, state, base, "arithmetic")?;
-                    acc = match op {
-                        Arith::Add => acc.checked_add(x).ok_or("integer overflow")?,
-                        Arith::Sub => acc.checked_sub(x).ok_or("integer overflow")?,
-                        Arith::Mul => acc.checked_mul(x).ok_or("integer overflow")?,
-                        Arith::Div => floor_div(acc, x)?.0,
-                        Arith::Mod => floor_div(acc, x)?.1,
-                        Arith::Min => acc.min(x),
-                        Arith::Max => acc.max(x),
-                    };
-                }
-                Value::Int(acc)
-            }
-            Expr::IndexOf(l, x) => {
-                let x = self.eval(x, state, base)?;
-                match self.eval(l, state, base)? {
-                    Value::List(l) => match l.iter().position(|v| *v == x) {
-                        Some(i) => Value::Int(i as i64),
-                        None => Value::Null,
-                    },
-                    v => return type_error(self, "index_of", &v),
-                }
-            }
-            Expr::In(x, l) => {
-                let x = self.eval(x, state, base)?;
-                match self.eval(l, state, base)? {
-                    Value::List(l) => Value::Bool(l.contains(&x)),
-                    v => return type_error(self, "in", &v),
-                }
-            }
+            Expr::Arith(op, items) => Value::Int(self.arith(*op, items, state, base)?),
+            Expr::IndexOf(l, x) => self.pair(x, l, state, base, |ctx, x, l| match l {
+                Value::List(l) => Ok(match l.iter().position(|v| same(v, x)) {
+                    Some(i) => Value::Int(i as i64),
+                    None => Value::Null,
+                }),
+                v => type_error(ctx, "index_of", v),
+            })?,
+            Expr::In(..) => Value::Bool(self.truth(e, state, base, "in")?),
             Expr::Range(a, b) => {
                 let (a, b) = (
                     self.int(a, state, base, "range")?,
@@ -947,8 +1210,9 @@ impl Ctx<'_> {
                 op,
                 list,
                 slot,
+                indexed,
                 body,
-            } => self.iter(*op, list, *slot, body, state, base)?,
+            } => self.iter(*op, list, *slot, *indexed, body, state, base)?,
             Expr::Let(bindings, body) => {
                 for (slot, value) in bindings {
                     let v = self.eval(value, state, base)?;
@@ -960,21 +1224,51 @@ impl Ctx<'_> {
                 if let Some(v) = &self.memo[*def] {
                     return Ok(v.clone());
                 }
-                let v = self.call(*def, args, state, base)?;
+                let v = self.call(*def, args, state, base, |ctx, body, base| {
+                    ctx.eval(body, state, base)
+                })?;
                 self.memo[*def] = Some(v.clone());
                 v
             }
-            Expr::Call(def, args) => self.call(*def, args, state, base)?,
+            Expr::Call(def, args) => self.call(*def, args, state, base, |ctx, body, base| {
+                ctx.eval(body, state, base)
+            })?,
         })
     }
 
-    fn call(
+    fn arith(
+        &mut self,
+        op: Arith,
+        items: &[Expr],
+        state: &[Value],
+        base: usize,
+    ) -> EvalResult<i64> {
+        let mut acc = self.int(&items[0], state, base, "arithmetic")?;
+        for item in &items[1..] {
+            let x = self.int(item, state, base, "arithmetic")?;
+            acc = match op {
+                Arith::Add => acc.checked_add(x).ok_or("integer overflow")?,
+                Arith::Sub => acc.checked_sub(x).ok_or("integer overflow")?,
+                Arith::Mul => acc.checked_mul(x).ok_or("integer overflow")?,
+                Arith::Div => floor_div(acc, x)?.0,
+                Arith::Mod => floor_div(acc, x)?.1,
+                Arith::Min => acc.min(x),
+                Arith::Max => acc.max(x),
+            };
+        }
+        Ok(acc)
+    }
+
+    /// Calls a def: evaluates the arguments into a new frame, then hands
+    /// the def's body and the frame's base to `evaluate`.
+    fn call<R>(
         &mut self,
         def: usize,
         args: &[Expr],
         state: &[Value],
         base: usize,
-    ) -> EvalResult<Value> {
+        evaluate: impl FnOnce(&mut Self, &Expr, usize) -> EvalResult<R>,
+    ) -> EvalResult<R> {
         let def_ref = &self.defs[def];
         if args.len() != def_ref.arity {
             return Err(EvalError::from(format!(
@@ -997,7 +1291,7 @@ impl Ctx<'_> {
         }
         self.stack.resize(new_base + frame, Value::Null);
         let defs = self.defs;
-        let result = self.eval(&defs[def].body, state, new_base);
+        let result = evaluate(self, &defs[def].body, new_base);
         self.stack.truncate(new_base);
         result
     }
@@ -1017,11 +1311,14 @@ impl Ctx<'_> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
     fn iter(
         &mut self,
         op: IterOp,
         list: &Expr,
         slot: usize,
+        indexed: bool,
         body: &Expr,
         state: &[Value],
         base: usize,
@@ -1030,18 +1327,27 @@ impl Ctx<'_> {
         let n = items.len();
         let item = |i: usize| items.get(i);
         let backwards = matches!(op, IterOp::FindLast | IterOp::FindLastIndex);
+        // A list result takes one allocation of the largest size it can
+        // have, where growing it item by item would take several.
         let mut mapped = Vec::new();
         let mut keyed = Vec::new();
+        match op {
+            IterOp::Map | IterOp::Filter => mapped.reserve_exact(n),
+            IterOp::SortBy => keyed.reserve_exact(n),
+            _ => {}
+        }
         let mut count = 0;
         for step in 0..n {
             let i = if backwards { n - 1 - step } else { step };
             self.stack[base + slot] = item(i);
-            self.stack[base + slot + 1] = Value::Int(i as i64);
+            if indexed {
+                self.stack[base + slot + 1] = Value::Int(i as i64);
+            }
             match op {
                 IterOp::Map => mapped.push(self.eval(body, state, base)?),
                 IterOp::SortBy => keyed.push((self.eval(body, state, base)?, i)),
                 _ => {
-                    let hit = self.truth(body, state, base, "an iteration")?;
+                    let hit = self.test(body, state, base, "an iteration")?;
                     match op {
                         IterOp::Filter if hit => mapped.push(item(i)),
                         IterOp::Count if hit => count += 1,
@@ -1079,7 +1385,36 @@ impl Ctx<'_> {
         })
     }
 
-    /// Evaluates a condition. Boolean operations, comparisons and literal
+    /// Evaluates a condition. A comparison of two stored values answers
+    /// here without a call. Every other condition goes through
+    /// [`Ctx::truth`].
+    #[inline(always)]
+    pub(crate) fn test(
+        &mut self,
+        e: &Expr,
+        state: &[Value],
+        base: usize,
+        what: &str,
+    ) -> EvalResult<bool> {
+        match e {
+            Expr::Eq(l, r) if simple(l) && simple(r) => {
+                Ok(same(self.peek(l, state, base)?, self.peek(r, state, base)?))
+            }
+            Expr::Ne(l, r) if simple(l) && simple(r) => Ok(!same(
+                self.peek(l, state, base)?,
+                self.peek(r, state, base)?,
+            )),
+            Expr::Cmp(ord, negate, l, r) if simple(l) && simple(r) => {
+                match (self.peek(l, state, base)?, self.peek(r, state, base)?) {
+                    (Value::Int(a), Value::Int(b)) => Ok((a.cmp(b) == *ord) != *negate),
+                    _ => self.truth(e, state, base, what),
+                }
+            }
+            _ => self.truth(e, state, base, what),
+        }
+    }
+
+    /// Evaluates a condition. Boolean operations, comparisons and
     /// membership answer here directly, reading simple operands in place.
     pub(crate) fn truth(
         &mut self,
@@ -1091,7 +1426,7 @@ impl Ctx<'_> {
         match e {
             Expr::And(items) => {
                 for item in items {
-                    if !self.truth(item, state, base, "and")? {
+                    if !self.test(item, state, base, "and")? {
                         return Ok(false);
                     }
                 }
@@ -1099,26 +1434,30 @@ impl Ctx<'_> {
             }
             Expr::Or(items) => {
                 for item in items {
-                    if self.truth(item, state, base, "or")? {
+                    if self.test(item, state, base, "or")? {
                         return Ok(true);
                     }
                 }
                 Ok(false)
             }
-            Expr::Not(x) => Ok(!self.truth(x, state, base, "not")?),
-            Expr::Eq(l, r) => self.compare(l, r, state, base, |a, b| Ok(a == b)),
-            Expr::Ne(l, r) => self.compare(l, r, state, base, |a, b| Ok(a != b)),
+            Expr::Not(x) => Ok(!self.test(x, state, base, "not")?),
+            Expr::Eq(l, r) => self.pair(l, r, state, base, |_, a, b| Ok(same(a, b))),
+            Expr::Ne(l, r) => self.pair(l, r, state, base, |_, a, b| Ok(!same(a, b))),
+            Expr::In(x, l) => self.pair(x, l, state, base, |ctx, x, l| match l {
+                Value::List(l) => Ok(l.iter().any(|v| same(v, x))),
+                v => type_error(ctx, "in", v),
+            }),
             Expr::Cmp(ord, negate, l, r) => {
                 let symbols = self.symbols;
-                self.compare(l, r, state, base, |a, b| {
-                    if std::mem::discriminant(a) != std::mem::discriminant(b) {
-                        return Err(EvalError::from(format!(
-                            "cannot order {} and {}",
-                            Show(symbols, a),
-                            Show(symbols, b)
-                        )));
-                    }
-                    Ok((a.cmp(b) == *ord) != *negate)
+                self.pair(l, r, state, base, |_, a, b| {
+                    let order = match (a, b) {
+                        (Value::Int(a), Value::Int(b)) => a.cmp(b),
+                        _ if std::mem::discriminant(a) != std::mem::discriminant(b) => {
+                            return Err(unordered(symbols, a, b));
+                        }
+                        _ => a.cmp(b),
+                    };
+                    Ok((order == *ord) != *negate)
                 })
             }
             Expr::InLit(x, items) => {
@@ -1130,6 +1469,30 @@ impl Ctx<'_> {
                 }
             }
             Expr::Lit(Value::Bool(b)) => Ok(*b),
+            // A condition inside an `if`, a `let` or a def answers as a
+            // condition all the way down, without a value in between.
+            Expr::If(items) => {
+                let mut i = 0;
+                while i + 1 < items.len() {
+                    if self.test(&items[i], state, base, "if")? {
+                        return self.test(&items[i + 1], state, base, what);
+                    }
+                    i += 2;
+                }
+                self.test(&items[items.len() - 1], state, base, what)
+            }
+            Expr::Let(bindings, body) => {
+                for (slot, value) in bindings {
+                    let v = self.eval(value, state, base)?;
+                    self.stack[base + slot] = v;
+                }
+                self.test(body, state, base, what)
+            }
+            Expr::Call(def, args) if !args.is_empty() || self.memo.is_empty() => {
+                self.call(*def, args, state, base, |ctx, body, base| {
+                    ctx.test(body, state, base, what)
+                })
+            }
             _ => {
                 let v = self.eval(e, state, base)?;
                 match v.as_bool() {
@@ -1141,23 +1504,27 @@ impl Ctx<'_> {
     }
 
     /// Applies `f` to two operands, reading simple ones in place.
-    fn compare(
+    #[inline(always)]
+    fn pair<R>(
         &mut self,
         l: &Expr,
         r: &Expr,
         state: &[Value],
         base: usize,
-        f: impl FnOnce(&Value, &Value) -> EvalResult<bool>,
-    ) -> EvalResult<bool> {
+        f: impl FnOnce(&Self, &Value, &Value) -> EvalResult<R>,
+    ) -> EvalResult<R> {
+        if simple(l) && simple(r) {
+            return f(self, self.peek(l, state, base)?, self.peek(r, state, base)?);
+        }
         let lo = if simple(l) {
             None
         } else {
-            Some(self.eval(l, state, base)?)
+            Some(self.compute(l, state, base)?)
         };
         let ro = if simple(r) {
             None
         } else {
-            Some(self.eval(r, state, base)?)
+            Some(self.compute(r, state, base)?)
         };
         let lv = match &lo {
             Some(v) => v,
@@ -1167,40 +1534,67 @@ impl Ctx<'_> {
             Some(v) => v,
             None => self.peek(r, state, base)?,
         };
-        f(lv, rv)
+        f(self, lv, rv)
     }
 
     /// Reads a [`simple`] expression in place.
+    #[inline(always)]
     fn peek<'s>(&'s self, e: &'s Expr, state: &'s [Value], base: usize) -> EvalResult<&'s Value> {
-        let local = |l: &usize| &self.stack[base + l];
-        Ok(match e {
-            Expr::Lit(v) => v,
-            Expr::Field(f) => &state[*f],
-            Expr::Local(l) => local(l),
-            Expr::Path(root, keys) => {
-                let mut cur = match root {
-                    Root::Field(f) => &state[*f],
-                    Root::Local(l) => local(l),
-                };
-                for k in keys {
-                    let key = match k {
-                        Expr::Lit(v) => v,
-                        Expr::Local(l) => local(l),
-                        _ => unreachable!("peek on a path with a computed key"),
-                    };
-                    cur = step(self.symbols, cur, key)?;
-                }
-                cur
-            }
+        match e {
+            Expr::Lit(v) => Ok(v),
+            Expr::Field(f) => Ok(&state[*f]),
+            Expr::Local(l) => Ok(&self.stack[base + l]),
+            Expr::Path(root, keys, hints) => self.follow(*root, keys, hints, state, base),
             _ => unreachable!("peek on an expression that is not simple"),
-        })
+        }
     }
 
+    /// Reads a path whose keys are literals or locals.
+    fn follow<'s>(
+        &'s self,
+        root: Root,
+        keys: &'s [Expr],
+        hints: &'s Hints,
+        state: &'s [Value],
+        base: usize,
+    ) -> EvalResult<&'s Value> {
+        let mut cur = match root {
+            Root::Field(f) => &state[f],
+            Root::Local(l) => &self.stack[base + l],
+        };
+        for (k, found) in keys.iter().zip(&hints.found) {
+            let key = match k {
+                Expr::Lit(v) => v,
+                Expr::Local(l) => &self.stack[base + l],
+                _ => unreachable!("a simple path with a computed key"),
+            };
+            cur = step(self.symbols, cur, key, found)?;
+        }
+        Ok(cur)
+    }
+
+    /// Evaluates an integer. Stored values, lengths and arithmetic answer
+    /// here, without a value in between.
     fn int(&mut self, e: &Expr, state: &[Value], base: usize, what: &str) -> EvalResult<i64> {
-        let v = self.eval(e, state, base)?;
+        let held;
+        let v = match e {
+            Expr::Arith(op, items) => return self.arith(*op, items, state, base),
+            Expr::Len(x) if simple(x) => {
+                return match self.peek(x, state, base)? {
+                    Value::List(l) => Ok(l.len() as i64),
+                    Value::Rec(r) => Ok(r.len() as i64),
+                    v => type_error(self, "len", v),
+                };
+            }
+            _ if simple(e) => self.peek(e, state, base)?,
+            _ => {
+                held = self.compute(e, state, base)?;
+                &held
+            }
+        };
         match v.as_int() {
             Some(i) => Ok(i),
-            None => type_error(self, what, &v),
+            None => type_error(self, what, v),
         }
     }
 
@@ -1223,6 +1617,7 @@ impl Ctx<'_> {
                         *slot = v;
                         Ok(())
                     })?;
+                    self.keys = keys;
                 }
                 Effect::Append { field, path, value } => {
                     let keys = self.keys(path, state, base)?;
@@ -1234,6 +1629,7 @@ impl Ctx<'_> {
                         }
                         other => type_error(ctx, "append", other),
                     })?;
+                    self.keys = keys;
                 }
                 Effect::Clear { field, path } => {
                     let keys = self.keys(path, state, base)?;
@@ -1244,6 +1640,7 @@ impl Ctx<'_> {
                         };
                         Ok(())
                     })?;
+                    self.keys = keys;
                 }
                 Effect::Remove { field, path, at } => {
                     let keys = self.keys(path, state, base)?;
@@ -1261,9 +1658,10 @@ impl Ctx<'_> {
                         },
                         other => type_error(ctx, "remove", other),
                     })?;
+                    self.keys = keys;
                 }
                 Effect::If(cond, then, otherwise) => {
-                    let branch = if self.truth(cond, state, base, "if")? {
+                    let branch = if self.test(cond, state, base, "if")? {
                         then
                     } else {
                         otherwise
@@ -1287,8 +1685,15 @@ impl Ctx<'_> {
         Ok(true)
     }
 
+    /// Evaluates the keys of an effect's path into the context's buffer,
+    /// which the caller gives back once the effect is applied.
     fn keys(&mut self, path: &[Expr], state: &[Value], base: usize) -> EvalResult<Vec<Value>> {
-        path.iter().map(|k| self.eval(k, state, base)).collect()
+        let mut keys = std::mem::take(&mut self.keys);
+        keys.clear();
+        for k in path {
+            keys.push(self.eval(k, state, base)?);
+        }
+        Ok(keys)
     }
 
     /// Calls `f` on the value at `keys` below `root`, copying shared lists

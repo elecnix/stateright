@@ -223,3 +223,90 @@ fn type_errors_fail_the_check() {
         "{e}"
     );
 }
+
+#[test]
+fn a_path_reads_records_that_keep_a_field_at_different_positions() {
+    // "k" is the second field of the first record, the first of the second
+    // and the third of the third, so no remembered position fits them all.
+    let m = json!({
+        "stateright": 1,
+        "init": [{"xs": [{"a": 1, "k": 5}, {"k": 6}, {"b": 0, "c": 0, "k": 7}], "ok": false}],
+        "actions": [{"name": "eval", "guard": {"not": {"var": "ok"}}, "effects": [
+            {"require": {"==": [
+                {"map": [{"range": [0, 3]}, "i", {"get": [{"get": [{"var": "xs"}, {"var": "i"}]}, "k"]}]},
+                [5, 6, 7]]}},
+            {"require": {"==": [
+                {"map": [[2, 1, 0, 2], "i", {"get": [{"get": [{"var": "xs"}, {"var": "i"}]}, "k"]}]},
+                [7, 6, 5, 7]]}},
+            {"require": {"==": [{"map": [{"var": "xs"}, "x", {"get": [{"var": "x"}, "k"]}]}, [5, 6, 7]]}},
+            {"set": "ok", "to": true}
+        ]}],
+        "invariants": [{"name": "evaluated", "sometimes": {"var": "ok"}}]
+    });
+    let report = run(m, 1);
+    assert_eq!(report["invariants"][0]["status"], "reached", "{report}");
+}
+
+#[test]
+fn conditions_answer_through_if_let_and_defs() {
+    let m = json!({
+        "stateright": 1,
+        "defs": {
+            "small": {"params": ["x"], "body": {"<": [{"var": "x"}, 3]}},
+            "none": {"params": [], "body": {"==": [{"len": {"var": "xs"}}, 0]}}
+        },
+        "init": [{"n": 0, "xs": [1, 2, 3]}],
+        "actions": [{"name": "inc",
+            "guard": {"and": [
+                {"if": [{"==": [{"var": "n"}, 0]}, true, {"call": ["small", {"var": "n"}]}]},
+                {"let": [[["m", {"+": [{"var": "n"}, 1]}]], {"<=": [{"var": "m"}, 3]}]},
+                {"not": {"call": ["none"]}},
+                {"<": [{"-": [{"len": {"var": "xs"}}, 1]}, {"len": {"var": "xs"}}]},
+                {"in": [{"+": [{"var": "n"}, 1]}, {"var": "xs"}]},
+                {"some": [{"var": "xs"}, "x", {">": [{"var": "x"}, {"var": "n"}]}]}
+            ]},
+            "effects": [{"set": "n", "to": {"+": [{"var": "n"}, 1]}}]}],
+        "invariants": [{"name": "small", "always": {"<=": [{"var": "n"}, 3]}}]
+    });
+    let report = run(m, 1);
+    assert_eq!(report["result"], "ok", "{report}");
+    assert_eq!(report["states"], 4);
+}
+
+#[test]
+fn a_condition_that_is_not_a_boolean_fails_wherever_it_is_nested() {
+    for guard in [
+        json!({"if": [true, 1, false]}),
+        json!({"let": [[["m", 1]], {"var": "m"}]}),
+        json!({"call": ["one"]}),
+        json!({"and": [true, {"if": [false, true, "x"]}]}),
+    ] {
+        let m = json!({
+            "stateright": 1,
+            "defs": {"one": {"params": [], "body": 1}},
+            "init": [{"n": 0}],
+            "actions": [{"name": "a", "guard": guard}],
+            "invariants": [{"name": "i", "always": true}]
+        });
+        let e = check(JsonModel::from_json(&m).unwrap(), &CheckOptions::default()).unwrap_err();
+        assert!(e.contains("expects a different type"), "{guard}: {e}");
+    }
+}
+
+#[test]
+fn comparisons_order_values_of_one_type_and_reject_mixed_ones() {
+    let m = json!({
+        "stateright": 1,
+        "init": [{"n": 1, "s": "b", "ok": false}],
+        "actions": [{"name": "eval", "guard": {"not": {"var": "ok"}}, "effects": [
+            {"require": {"<": [{"var": "n"}, 2]}},
+            {"require": {">=": [{"var": "n"}, 1]}},
+            {"require": {"<": ["a", {"var": "s"}]}},
+            {"require": {"<=": [[1, 2], [1, 3]]}},
+            {"set": "ok", "to": {">": [{"var": "s"}, {"var": "n"}]}}
+        ]}],
+        "invariants": [{"name": "i", "always": true}]
+    });
+    let e = check(JsonModel::from_json(&m).unwrap(), &CheckOptions::default()).unwrap_err();
+    assert!(e.contains("cannot order"), "{e}");
+}

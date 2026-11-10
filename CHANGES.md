@@ -17,6 +17,17 @@
   one allocation. Before, every generated state copied its path twice.
 - Declarative models: each list and record remembers its hash, so the
   fingerprint of a successor state hashes only the values the step changed.
+- Declarative models: each thread remembers the steps an action offered
+  for the values of the state fields the action reads, and repeats them in
+  other states that agree on those fields.
+- Declarative models: conditions and integers evaluate without building a
+  value in between, a path reads a record's field at the position where the
+  field was last found, and each thread keeps its evaluation buffers
+  between states.
+- The stable hasher derives its keys once per process. Before, every
+  fingerprint derived them again.
+- The review workflow passes the model endpoint to Cite as inputs. Passed
+  as environment variables, the action replaced them with its defaults.
 - Edition 2024, `rust-version = "1.88"`.
 
 ## 0.31.0
