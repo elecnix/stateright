@@ -3,8 +3,8 @@ name: Rust
 on:
   push:
     branches: [master]
+  # Every pull request, stacked ones included.
   pull_request:
-    branches: [master]
   workflow_dispatch:
 
 permissions:
