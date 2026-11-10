@@ -1399,10 +1399,9 @@ impl<'a> Ctx<'a> {
         what: &str,
     ) -> EvalResult<bool> {
         match e {
-            Expr::Eq(l, r) if simple(l) && simple(r) => Ok(same(
-                self.peek(l, state, base)?,
-                self.peek(r, state, base)?,
-            )),
+            Expr::Eq(l, r) if simple(l) && simple(r) => {
+                Ok(same(self.peek(l, state, base)?, self.peek(r, state, base)?))
+            }
             Expr::Ne(l, r) if simple(l) && simple(r) => Ok(!same(
                 self.peek(l, state, base)?,
                 self.peek(r, state, base)?,
@@ -1515,11 +1514,7 @@ impl<'a> Ctx<'a> {
         f: impl FnOnce(&Self, &Value, &Value) -> EvalResult<R>,
     ) -> EvalResult<R> {
         if simple(l) && simple(r) {
-            return f(
-                self,
-                self.peek(l, state, base)?,
-                self.peek(r, state, base)?,
-            );
+            return f(self, self.peek(l, state, base)?, self.peek(r, state, base)?);
         }
         let lo = if simple(l) {
             None

@@ -94,10 +94,6 @@ pub struct JsonModel {
     pub(crate) actions: Vec<Action>,
     normalize: Vec<Effect>,
     normalize_frame: usize,
-    /// The state fields the `normalize` effects read, and the ones they
-    /// can change, as for an [`Action`].
-    normalize_reads: Vec<usize>,
-    normalize_writes: Vec<usize>,
     /// The largest frame of any action.
     action_frame: usize,
     /// The largest frame of any invariant.
@@ -339,8 +335,6 @@ impl JsonModel {
             actions,
             normalize,
             normalize_frame,
-            normalize_reads: set(&normalize_access.reads),
-            normalize_writes: set(&normalize_access.writes),
             action_frame,
             invariant_frame,
             invariants,
@@ -449,7 +443,13 @@ impl JsonModel {
 
     fn evaluate_invariants(&self, state: &JsonState, checked: &mut Checked) {
         let buffers = std::mem::take(&mut checked.buffers);
-        let mut ctx = Ctx::new(&self.symbols, &self.defs, self.invariant_frame, true, buffers);
+        let mut ctx = Ctx::new(
+            &self.symbols,
+            &self.defs,
+            self.invariant_frame,
+            true,
+            buffers,
+        );
         checked.results.clear();
         for inv in &self.invariants {
             checked.results.push(match (&inv.kind, &inv.expr) {
@@ -471,7 +471,8 @@ impl JsonModel {
         MEMO.with(|cell| {
             let mut memo = cell.borrow_mut();
             memo.attach(self);
-            let context = |frame, buffers| Ctx::new(&self.symbols, &self.defs, frame, false, buffers);
+            let context =
+                |frame, buffers| Ctx::new(&self.symbols, &self.defs, frame, false, buffers);
             let mut ctx = context(self.action_frame, std::mem::take(&mut memo.buffers.0));
             let mut nctx = context(self.normalize_frame, std::mem::take(&mut memo.buffers.1));
             let result = self.enabled_with(state, &mut ctx, &mut nctx, &mut memo, out);
@@ -488,90 +489,45 @@ impl JsonModel {
         memo: &mut Memo,
         out: &mut Vec<JsonAction>,
     ) -> Result<(), String> {
-        {
-            let mut args = Vec::new();
-            for (ai, action) in self.actions.iter().enumerate() {
-                let fail = |e: String| format!("action {:?}: {e}", action.name);
-                let hash = match memo.lookup(ai, &action.reads, &state.fields) {
-                    Lookup::Hit(steps) => {
-                        for step in steps {
-                            let mut fields = state.fields.clone();
-                            step.write(&action.writes, &mut fields);
-                            out.push(JsonAction {
-                                action: ai,
-                                args: Arc::clone(&step.args),
-                                next: JsonState {
-                                    fields,
-                                    violated: step.violated,
-                                },
-                            });
+        let mut args = Vec::new();
+        for (ai, action) in self.actions.iter().enumerate() {
+            let hash = match memo.lookup(ai, &action.reads, &state.fields) {
+                Lookup::Hit(steps) => {
+                    for step in steps {
+                        let mut fields = state.fields.clone();
+                        for (f, v) in action.writes.iter().zip(&step.written) {
+                            fields[*f] = v.clone();
                         }
-                        continue;
-                    }
-                    Lookup::Miss(hash) => Some(hash),
-                    Lookup::Paused => None,
-                };
-                let start = out.len();
-                self.each_binding(ai, state, ctx, nctx, memo, &mut args, out)
-                    .map_err(fail)?;
-                if let Some(hash) = hash {
-                    let steps = out[start..]
-                        .iter()
-                        .map(|step| Step {
+                        out.push(JsonAction {
+                            action: ai,
                             args: Arc::clone(&step.args),
-                            violated: step.next.violated,
-                            written: pick(&step.next.fields, &action.writes),
-                        })
-                        .collect();
-                    memo.remember(hash, ai, pick(&state.fields, &action.reads), steps);
-                }
-            }
-            Ok(())
-        }
-    }
-
-    /// Runs the model's `normalize` effects on `next`. Returns `false` when
-    /// one of their `require` conditions fails, which disables the step.
-    fn normalized(
-        &self,
-        next: &mut [Value],
-        nctx: &mut Ctx,
-        memo: &mut Memo,
-    ) -> Result<bool, String> {
-        let mut run = |next: &mut [Value]| {
-            let mut ignored = 0;
-            nctx.apply(&self.normalize, next, &mut ignored, 0)
-                .map_err(|e| format!("normalize: {e}"))
-        };
-        // Steps from different states often meet in the same values of the
-        // fields these effects read, so the memo answers most of them.
-        let kind = self.actions.len();
-        let hash = match memo.lookup(kind, &self.normalize_reads, next) {
-            Lookup::Hit(steps) => {
-                return Ok(match steps.first() {
-                    Some(step) => {
-                        step.write(&self.normalize_writes, next);
-                        true
+                            next: JsonState {
+                                fields,
+                                violated: step.violated,
+                            },
+                        });
                     }
-                    None => false,
-                });
+                    continue;
+                }
+                Lookup::Miss(hash) => Some(hash),
+                Lookup::Paused => None,
+            };
+            let start = out.len();
+            self.each_binding(ai, state, ctx, nctx, &memo.no_args, &mut args, out)
+                .map_err(|e| format!("action {:?}: {e}", action.name))?;
+            if let Some(hash) = hash {
+                let steps = out[start..]
+                    .iter()
+                    .map(|step| Step {
+                        args: Arc::clone(&step.args),
+                        violated: step.next.violated,
+                        written: pick(&step.next.fields, &action.writes),
+                    })
+                    .collect();
+                memo.remember(hash, ai, pick(&state.fields, &action.reads), steps);
             }
-            Lookup::Miss(hash) => hash,
-            Lookup::Paused => return run(next),
-        };
-        let key = pick(next, &self.normalize_reads);
-        let enabled = run(next)?;
-        let steps = if enabled {
-            vec![Step {
-                args: Arc::clone(&memo.no_args),
-                violated: 0,
-                written: pick(next, &self.normalize_writes),
-            }]
-        } else {
-            Vec::new()
-        };
-        memo.remember(hash, kind, key, steps);
-        Ok(enabled)
+        }
+        Ok(())
     }
 
     fn each_binding(
@@ -580,7 +536,7 @@ impl JsonModel {
         state: &JsonState,
         ctx: &mut Ctx,
         nctx: &mut Ctx,
-        memo: &mut Memo,
+        no_args: &Arc<[Value]>,
         args: &mut Vec<Value>,
         out: &mut Vec<JsonAction>,
     ) -> Result<(), String> {
@@ -593,7 +549,7 @@ impl JsonModel {
                 let v = domain.get(i);
                 ctx.stack[depth] = v.clone();
                 args.push(v);
-                self.each_binding(ai, state, ctx, nctx, memo, args, out)?;
+                self.each_binding(ai, state, ctx, nctx, no_args, args, out)?;
                 args.pop();
             }
             return Ok(());
@@ -612,14 +568,17 @@ impl JsonModel {
         if !ctx.apply(&action.effects, &mut next, &mut violated, 0)? {
             return Ok(());
         }
-        if action.normalize
-            && !self.normalize.is_empty()
-            && !self.normalized(&mut next, nctx, memo)?
-        {
-            return Ok(());
+        if action.normalize && !self.normalize.is_empty() {
+            let mut ignored = 0;
+            if !nctx
+                .apply(&self.normalize, &mut next, &mut ignored, 0)
+                .map_err(|e| format!("normalize: {e}"))?
+            {
+                return Ok(());
+            }
         }
         let args: Arc<[Value]> = if args.is_empty() {
-            Arc::clone(&memo.no_args)
+            Arc::clone(no_args)
         } else {
             Arc::from(&args[..])
         };
@@ -807,46 +766,36 @@ impl Model for JsonModel {
 static NEXT_MODEL_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The slots of a thread's memo. A power of two.
-const MEMO_SLOTS: usize = 1 << 16; // BITS
-/// How many lookups of one kind a thread counts before it judges whether
-/// the memo helps that kind.
+const MEMO_SLOTS: usize = 1 << 16;
+/// How many lookups of one action a thread counts before it judges whether
+/// the memo helps that action.
 const MEMO_WINDOW: u32 = 1024;
-/// The fewest hits in a window for the memo to stay on for a kind.
+/// The fewest hits in a window for the memo to stay on for an action.
 const MEMO_MIN_HITS: u32 = MEMO_WINDOW / 8;
-/// How many lookups a kind skips the memo for after its first poor window.
-/// Each poor window in a row doubles the pause, up to `MEMO_LONGEST_PAUSE`.
+/// How many lookups an action skips the memo for after its first poor
+/// window. Each poor window in a row doubles the pause, up to
+/// `MEMO_LONGEST_PAUSE`.
 const MEMO_PAUSE: u32 = 8 * MEMO_WINDOW;
 const MEMO_LONGEST_PAUSE: u32 = 1 << 24;
 
 /// One step an action offers: its arguments, the invariant bits the step
-/// violates, and the new values of the fields the action can change. For
-/// the `normalize` effects, the new values of the fields they can change.
+/// violates, and the new values of the fields the action can change.
 struct Step {
     args: Arc<[Value]>,
     violated: u64,
     written: Vec<Value>,
 }
 
-impl Step {
-    fn write(&self, writes: &[usize], fields: &mut [Value]) {
-        for (f, v) in writes.iter().zip(&self.written) {
-            fields[*f] = v.clone();
-        }
-    }
-}
-
-/// What one kind of evaluation did in the states that have `key` in the
-/// fields it reads.
+/// What an action did in the states that have `key` in the fields it reads.
 struct Remembered {
     hash: u64,
-    kind: usize,
+    action: usize,
     key: Vec<Value>,
     steps: Vec<Step>,
 }
 
 #[derive(Clone, Default)]
 struct Usage {
-    tl: u64, th: u64, tp: u64,
     lookups: u32,
     hits: u32,
     /// Lookups left to skip.
@@ -862,19 +811,20 @@ enum Lookup<'m> {
     Hit(&'m [Step]),
     /// Nothing remembered. Carries the hash to remember the steps under.
     Miss(u64),
-    /// The memo is off for this kind for now, because it rarely hit.
+    /// The memo is off for this action for now, because it rarely hit.
     Paused,
 }
 
-/// A thread's memo of evaluations. An action reads some of the state's
-/// fields, and it does the same in every state that agrees on them. The
-/// `normalize` effects are the same, for the fields they read. The memo
-/// remembers what each of these kinds did for the field values it has seen.
-/// A kind is an action's index, or the number of actions for `normalize`.
+/// A thread's memo of what each action does. An action reads some of the
+/// state's fields, and it does the same in every state that agrees on them.
+/// Many states do when the action reads few fields: the search reaches them
+/// by changing the others. The memo remembers the steps the action offered
+/// for the field values it has seen.
 ///
 /// The memo is a fixed table, where a new entry replaces the one in its
 /// slot, so its size does not grow with the search. Each thread has its
-/// own, so a lookup takes no lock.
+/// own, so a lookup takes no lock. An action that rarely hits, because it
+/// reads most of the state, stops using the memo for a while.
 struct Memo {
     model: u64,
     slots: Vec<Option<Remembered>>,
@@ -885,15 +835,6 @@ struct Memo {
     buffers: (Buffers, Buffers),
 }
 
-impl Drop for Memo {
-    fn drop(&mut self) {
-        if std::env::var("MEMO_STATS").is_ok() {
-            for (i, u) in self.usage.iter().enumerate() {
-                eprintln!("kind {i}: {} {} {}", u.tl, u.th, u.tp);
-            }
-        }
-    }
-}
 impl Memo {
     fn new() -> Memo {
         Memo {
@@ -909,17 +850,17 @@ impl Memo {
     fn attach(&mut self, model: &JsonModel) {
         if self.model != model.id {
             self.model = model.id;
-            self.slots.clear();
-            self.slots.resize_with(MEMO_SLOTS, || None);
-            self.usage = vec![Usage::default(); model.actions.len() + 1];
+            self.slots = Vec::new();
+            self.usage = vec![Usage::default(); model.actions.len()];
         }
     }
 
-    /// Looks up what `kind` did for the values `fields` has in `reads`.
-    fn lookup(&mut self, kind: usize, reads: &[usize], fields: &[Value]) -> Lookup<'_> {
-        let usage = &mut self.usage[kind];
+    /// Looks up what action `ai` did for the values `fields` has in the
+    /// fields the action reads.
+    fn lookup(&mut self, ai: usize, reads: &[usize], fields: &[Value]) -> Lookup<'_> {
+        let usage = &mut self.usage[ai];
         if usage.pause > 0 {
-            usage.pause -= 1; usage.tp += 1;
+            usage.pause -= 1;
             return Lookup::Paused;
         }
         if usage.lookups == MEMO_WINDOW {
@@ -933,20 +874,20 @@ impl Memo {
             }
             usage.next_pause = 0;
         }
-        usage.lookups += 1; usage.tl += 1;
+        usage.lookups += 1;
         let mut hasher = crate::stable::hasher();
-        hasher.write_usize(kind);
+        hasher.write_usize(ai);
         for f in reads {
             fields[*f].hash(&mut hasher);
         }
         let hash = hasher.finish();
-        match &self.slots[hash as usize & (MEMO_SLOTS - 1)] {
-            Some(entry)
+        match self.slots.get(hash as usize & (MEMO_SLOTS - 1)) {
+            Some(Some(entry))
                 if entry.hash == hash
-                    && entry.kind == kind
+                    && entry.action == ai
                     && entry.key.iter().eq(reads.iter().map(|f| &fields[*f])) =>
             {
-                usage.hits += 1; usage.th += 1;
+                usage.hits += 1;
                 #[cfg(test)]
                 {
                     usage.total_hits += 1;
@@ -957,20 +898,33 @@ impl Memo {
         }
     }
 
-    /// Remembers what `kind` did for the field values in `key`.
-    fn remember(&mut self, hash: u64, kind: usize, key: Vec<Value>, steps: Vec<Step>) {
+    /// Remembers the steps action `ai` offered for the field values in
+    /// `key`. The table is allocated on the first call.
+    fn remember(&mut self, hash: u64, ai: usize, key: Vec<Value>, steps: Vec<Step>) {
+        if self.slots.is_empty() {
+            self.slots.resize_with(MEMO_SLOTS, || None);
+        }
         self.slots[hash as usize & (MEMO_SLOTS - 1)] = Some(Remembered {
             hash,
-            kind,
+            action: ai,
             key,
             steps,
         });
     }
 }
 
+/// How many times this thread's memo answered for `model`, per action.
+#[cfg(test)]
+pub(crate) fn memo_hits(model: &JsonModel) -> Vec<u64> {
+    MEMO.with(|cell| {
+        let memo = cell.borrow();
+        assert_eq!(memo.model, model.id, "the memo is for another model");
+        memo.usage.iter().map(|u| u.total_hits).collect()
+    })
+}
+
 thread_local! {
-    /// What each action and the `normalize` effects did in the states this
-    /// thread expanded.
+    /// What each action did in the states this thread expanded.
     static MEMO: std::cell::RefCell<Memo> = std::cell::RefCell::new(Memo::new());
 
     /// The invariant answers for the state this thread checked last.
