@@ -406,17 +406,11 @@ mod test {
     fn err_for_invalid_index() {
         let checker = Arc::new(BinaryClock.checker().spawn_bfs().join());
         assert_eq!(
-            format!(
-                "{}",
-                get_states(Arc::clone(&checker), "/one/two/three").unwrap_err()
-            ),
+            get_states(Arc::clone(&checker), "/one/two/three").unwrap_err(),
             "Unable to parse action indices /one/two/three"
         );
         assert_eq!(
-            format!(
-                "{}",
-                get_states(Arc::clone(&checker), "/1/2/3").unwrap_err()
-            ),
+            get_states(Arc::clone(&checker), "/1/2/3").unwrap_err(),
             "Unable to find state following action indices /1/2/3"
         );
     }

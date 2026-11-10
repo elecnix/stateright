@@ -438,7 +438,7 @@ where
             .iter()
             .map(|mapref| {
                 (
-                    <&'static str>::clone(mapref.key()),
+                    *mapref.key(),
                     Path::from_action_indices(self.model(), VecDeque::from(mapref.value().clone())),
                 )
             })
