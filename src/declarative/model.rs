@@ -1,7 +1,7 @@
 //! A [`Model`] compiled from a declarative JSON document.
 
 use super::expr::{
-    Access, Ctx, Def, Effect, Expr, Scope, binding, compile, compile_effects, def_reads,
+    Access, Buffers, Ctx, Def, Effect, Expr, Scope, binding, compile, compile_effects, def_reads,
 };
 use super::value::{Symbols, Value, collect_strings};
 use crate::{Fingerprint, Model, Property, fingerprint};
@@ -100,6 +100,8 @@ pub struct JsonModel {
     normalize_writes: Vec<usize>,
     /// The largest frame of any action.
     action_frame: usize,
+    /// The largest frame of any invariant.
+    invariant_frame: usize,
     pub(crate) invariants: Vec<Invariant>,
     properties: Vec<Property<JsonModel>>,
     pub(crate) max_depth: Option<usize>,
@@ -326,6 +328,7 @@ impl JsonModel {
         };
 
         let action_frame = actions.iter().map(|a| a.frame).max().unwrap_or(0);
+        let invariant_frame = invariants.iter().map(|i| i.frame).max().unwrap_or(0);
         let mut model = JsonModel {
             id: NEXT_MODEL_ID.fetch_add(1, Ordering::Relaxed),
             name,
@@ -339,6 +342,7 @@ impl JsonModel {
             normalize_reads: set(&normalize_access.reads),
             normalize_writes: set(&normalize_access.writes),
             action_frame,
+            invariant_frame,
             invariants,
             properties: Vec::new(),
             max_depth,
@@ -425,15 +429,6 @@ impl JsonModel {
         self.error.lock().unwrap().clone()
     }
 
-    fn ctx(&self, frame: usize) -> Ctx<'_> {
-        Ctx {
-            symbols: &self.symbols,
-            defs: &self.defs,
-            stack: vec![Value::Null; frame],
-            memo: Vec::new(),
-        }
-    }
-
     fn holds(&self, i: usize, state: &JsonState) -> bool {
         if let Kind::Transition(bit) = self.invariants[i].kind {
             return state.violated & (1 << bit) == 0;
@@ -441,34 +436,23 @@ impl JsonModel {
         // The checker asks for each invariant of a state in turn. The first
         // question evaluates them all with one context, so zero-argument
         // defs they share run once, and the rest read the cached answers.
-        let key = self.id;
         CHECKED.with(|cell| {
-            let mut cached = cell.borrow_mut();
-            if let Some((model, fields, results)) = cached.as_ref()
-                && *model == key
-                && same_object(fields, &state.fields)
-            {
-                return results[i];
+            let mut checked = cell.borrow_mut();
+            if checked.model != self.id || !same_object(&checked.fields, &state.fields) {
+                checked.model = self.id;
+                checked.fields.clone_from(&state.fields);
+                self.evaluate_invariants(state, &mut checked);
             }
-            let results = self.evaluate_invariants(state);
-            let answer = results[i];
-            *cached = Some((key, state.fields.clone(), results));
-            answer
+            checked.results[i]
         })
     }
 
-    fn evaluate_invariants(&self, state: &JsonState) -> Vec<bool> {
-        let frame = self
-            .invariants
-            .iter()
-            .map(|inv| inv.frame)
-            .max()
-            .unwrap_or(0);
-        let mut ctx = self.ctx(frame);
-        ctx.memo = vec![None; self.defs.len().max(1)];
-        self.invariants
-            .iter()
-            .map(|inv| match (&inv.kind, &inv.expr) {
+    fn evaluate_invariants(&self, state: &JsonState, checked: &mut Checked) {
+        let buffers = std::mem::take(&mut checked.buffers);
+        let mut ctx = Ctx::new(&self.symbols, &self.defs, self.invariant_frame, true, buffers);
+        checked.results.clear();
+        for inv in &self.invariants {
+            checked.results.push(match (&inv.kind, &inv.expr) {
                 (Kind::Transition(bit), _) => state.violated & (1 << bit) == 0,
                 (_, Some(expr)) => match ctx.truth(expr, &state.fields, 0, inv.name) {
                     Ok(b) => b,
@@ -478,16 +462,33 @@ impl JsonModel {
                     }
                 },
                 (_, None) => true,
-            })
-            .collect()
+            });
+        }
+        checked.buffers = ctx.into_buffers();
     }
 
     fn enabled(&self, state: &JsonState, out: &mut Vec<JsonAction>) -> Result<(), String> {
         MEMO.with(|cell| {
             let mut memo = cell.borrow_mut();
             memo.attach(self);
-            let mut ctx = self.ctx(self.action_frame);
-            let mut nctx = self.ctx(self.normalize_frame);
+            let context = |frame, buffers| Ctx::new(&self.symbols, &self.defs, frame, false, buffers);
+            let mut ctx = context(self.action_frame, std::mem::take(&mut memo.buffers.0));
+            let mut nctx = context(self.normalize_frame, std::mem::take(&mut memo.buffers.1));
+            let result = self.enabled_with(state, &mut ctx, &mut nctx, &mut memo, out);
+            memo.buffers = (ctx.into_buffers(), nctx.into_buffers());
+            result
+        })
+    }
+
+    fn enabled_with(
+        &self,
+        state: &JsonState,
+        ctx: &mut Ctx,
+        nctx: &mut Ctx,
+        memo: &mut Memo,
+        out: &mut Vec<JsonAction>,
+    ) -> Result<(), String> {
+        {
             let mut args = Vec::new();
             for (ai, action) in self.actions.iter().enumerate() {
                 let fail = |e: String| format!("action {:?}: {e}", action.name);
@@ -511,7 +512,7 @@ impl JsonModel {
                     Lookup::Paused => None,
                 };
                 let start = out.len();
-                self.each_binding(ai, state, &mut ctx, &mut nctx, &mut memo, &mut args, out)
+                self.each_binding(ai, state, ctx, nctx, memo, &mut args, out)
                     .map_err(fail)?;
                 if let Some(hash) = hash {
                     let steps = out[start..]
@@ -526,7 +527,7 @@ impl JsonModel {
                 }
             }
             Ok(())
-        })
+        }
     }
 
     /// Runs the model's `normalize` effects on `next`. Returns `false` when
@@ -880,6 +881,8 @@ struct Memo {
     usage: Vec<Usage>,
     /// The arguments of an action without parameters.
     no_args: Arc<[Value]>,
+    /// The allocations of the action context and the `normalize` context.
+    buffers: (Buffers, Buffers),
 }
 
 impl Drop for Memo {
@@ -898,6 +901,7 @@ impl Memo {
             slots: Vec::new(),
             usage: Vec::new(),
             no_args: Arc::from(Vec::new()),
+            buffers: Default::default(),
         }
     }
 
@@ -970,11 +974,17 @@ thread_local! {
     static MEMO: std::cell::RefCell<Memo> = std::cell::RefCell::new(Memo::new());
 
     /// The invariant answers for the state this thread checked last.
-    static CHECKED: std::cell::RefCell<Option<Checked>> = const { std::cell::RefCell::new(None) };
+    static CHECKED: std::cell::RefCell<Checked> = std::cell::RefCell::new(Checked::default());
 }
 
 /// A model's id, a state's fields, and one answer per invariant.
-type Checked = (u64, Vec<Value>, Vec<bool>);
+#[derive(Default)]
+struct Checked {
+    model: u64,
+    fields: Vec<Value>,
+    results: Vec<bool>,
+    buffers: Buffers,
+}
 
 /// Whether two states are the same object: every list and record is the
 /// same allocation and every scalar is equal. The cache keeps its copy of

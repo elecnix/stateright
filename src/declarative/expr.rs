@@ -862,6 +862,17 @@ pub(crate) struct Ctx<'a> {
     /// Values of zero-argument defs for the one state this context reads.
     /// Empty when the context evaluates against a state that effects change.
     pub(crate) memo: Vec<Option<Value>>,
+    /// The keys of the path the current effect changes.
+    keys: Vec<Value>,
+}
+
+/// The allocations of a [`Ctx`], kept between evaluations so that each one
+/// does not allocate its own.
+#[derive(Default)]
+pub(crate) struct Buffers {
+    stack: Vec<Value>,
+    memo: Vec<Option<Value>>,
+    keys: Vec<Value>,
 }
 
 fn type_error<T>(ctx: &Ctx, what: &str, v: &Value) -> EvalResult<T> {
@@ -904,7 +915,47 @@ fn as_set(v: &Value) -> Vec<Value> {
     items
 }
 
-impl Ctx<'_> {
+impl<'a> Ctx<'a> {
+    /// A context with `frame` local slots, and with one memo slot per def
+    /// when `memoize` is set. Set it only to evaluate against one state
+    /// that does not change.
+    pub(crate) fn new(
+        symbols: &'a Symbols,
+        defs: &'a [Def],
+        frame: usize,
+        memoize: bool,
+        buffers: Buffers,
+    ) -> Self {
+        let Buffers {
+            mut stack,
+            mut memo,
+            mut keys,
+        } = buffers;
+        stack.clear();
+        stack.resize(frame, Value::Null);
+        memo.clear();
+        if memoize {
+            memo.resize(defs.len().max(1), None);
+        }
+        keys.clear();
+        Ctx {
+            symbols,
+            defs,
+            stack,
+            memo,
+            keys,
+        }
+    }
+
+    /// Gives the allocations back for the next context.
+    pub(crate) fn into_buffers(self) -> Buffers {
+        Buffers {
+            stack: self.stack,
+            memo: self.memo,
+            keys: self.keys,
+        }
+    }
+
     pub(crate) fn eval(&mut self, e: &Expr, state: &[Value], base: usize) -> EvalResult<Value> {
         Ok(match e {
             Expr::Lit(v) => v.clone(),
@@ -1217,8 +1268,15 @@ impl Ctx<'_> {
         let n = items.len();
         let item = |i: usize| items.get(i);
         let backwards = matches!(op, IterOp::FindLast | IterOp::FindLastIndex);
+        // A list result takes one allocation of the largest size it can
+        // have, where growing it item by item would take several.
         let mut mapped = Vec::new();
         let mut keyed = Vec::new();
+        match op {
+            IterOp::Map | IterOp::Filter => mapped.reserve_exact(n),
+            IterOp::SortBy => keyed.reserve_exact(n),
+            _ => {}
+        }
         let mut count = 0;
         for step in 0..n {
             let i = if backwards { n - 1 - step } else { step };
@@ -1419,6 +1477,7 @@ impl Ctx<'_> {
                         *slot = v;
                         Ok(())
                     })?;
+                    self.keys = keys;
                 }
                 Effect::Append { field, path, value } => {
                     let keys = self.keys(path, state, base)?;
@@ -1430,6 +1489,7 @@ impl Ctx<'_> {
                         }
                         other => type_error(ctx, "append", other),
                     })?;
+                    self.keys = keys;
                 }
                 Effect::Clear { field, path } => {
                     let keys = self.keys(path, state, base)?;
@@ -1440,6 +1500,7 @@ impl Ctx<'_> {
                         };
                         Ok(())
                     })?;
+                    self.keys = keys;
                 }
                 Effect::Remove { field, path, at } => {
                     let keys = self.keys(path, state, base)?;
@@ -1457,6 +1518,7 @@ impl Ctx<'_> {
                         },
                         other => type_error(ctx, "remove", other),
                     })?;
+                    self.keys = keys;
                 }
                 Effect::If(cond, then, otherwise) => {
                     let branch = if self.truth(cond, state, base, "if")? {
@@ -1483,8 +1545,15 @@ impl Ctx<'_> {
         Ok(true)
     }
 
+    /// Evaluates the keys of an effect's path into the context's buffer,
+    /// which the caller gives back once the effect is applied.
     fn keys(&mut self, path: &[Expr], state: &[Value], base: usize) -> EvalResult<Vec<Value>> {
-        path.iter().map(|k| self.eval(k, state, base)).collect()
+        let mut keys = std::mem::take(&mut self.keys);
+        keys.clear();
+        for k in path {
+            keys.push(self.eval(k, state, base)?);
+        }
+        Ok(keys)
     }
 
     /// Calls `f` on the value at `keys` below `root`, copying shared lists
