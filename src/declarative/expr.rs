@@ -42,6 +42,8 @@ pub(crate) enum Expr {
         op: IterOp,
         list: Box<Expr>,
         slot: usize,
+        /// Whether the body can read the index, in the slot after `slot`.
+        indexed: bool,
         body: Box<Expr>,
     },
     Let(Vec<(usize, Expr)>, Box<Expr>),
@@ -492,6 +494,7 @@ pub(crate) fn compile(scope: &mut Scope, json: &Json, at: &str) -> Result<Expr, 
             let (x, i) = binder(&a[1], at)?;
             let mark = scope.mark();
             let slot = scope.bind(&x);
+            let indexed = i.is_some();
             match i {
                 Some(i) => {
                     scope.bind(&i);
@@ -506,6 +509,7 @@ pub(crate) fn compile(scope: &mut Scope, json: &Json, at: &str) -> Result<Expr, 
                 op: iter,
                 list,
                 slot,
+                indexed,
                 body,
             }
         }
@@ -551,36 +555,57 @@ fn path(root: Root, keys: Vec<Expr>) -> Expr {
 
 /// Reads one key of a list or a record by reference. `found` is the
 /// position where a record last had the key at this place in the model.
+#[inline(always)]
 fn step<'v>(
     symbols: &Symbols,
     cur: &'v Value,
     key: &Value,
     found: &AtomicU32,
 ) -> EvalResult<&'v Value> {
-    let next = match (cur, key) {
+    match (cur, key) {
         (Value::List(l), Value::Int(i)) => {
             let n = l.len() as i64;
             let i = if *i < 0 { n + i } else { *i };
-            (0..n).contains(&i).then(|| &l[i as usize])
+            if (0..n).contains(&i) {
+                return Ok(&l[i as usize]);
+            }
         }
         (Value::Rec(r), Value::Str(s)) => {
             match r.get(found.load(AtomicOrdering::Relaxed) as usize) {
-                Some((k, v)) if k == s => Some(v),
-                _ => r.binary_search_by_key(s, |(k, _)| *k).ok().map(|i| {
-                    found.store(i as u32, AtomicOrdering::Relaxed);
-                    &r[i].1
-                }),
+                Some((k, v)) if k == s => return Ok(v),
+                _ => {
+                    if let Ok(i) = r.binary_search_by_key(s, |(k, _)| *k) {
+                        found.store(i as u32, AtomicOrdering::Relaxed);
+                        return Ok(&r[i].1);
+                    }
+                }
             }
         }
-        _ => None,
-    };
-    next.ok_or_else(|| {
-        EvalError::from(format!(
-            "get: no {} in {}",
-            Show(symbols, key),
-            Show(symbols, cur)
-        ))
-    })
+        _ => {}
+    }
+    Err(no_key(symbols, cur, key))
+}
+
+#[cold]
+#[inline(never)]
+fn no_key(symbols: &Symbols, cur: &Value, key: &Value) -> EvalError {
+    EvalError::from(format!(
+        "get: no {} in {}",
+        Show(symbols, key),
+        Show(symbols, cur)
+    ))
+}
+
+/// Whether two values are equal. Scalars of the same type compare here,
+/// without a call.
+#[inline(always)]
+fn same(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Int(a), Value::Int(b)) => a == b,
+        (Value::Str(a), Value::Str(b)) => a == b,
+        (Value::Bool(a), Value::Bool(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 /// Whether an expression reads a value already stored: a literal, a state
@@ -875,12 +900,24 @@ pub(crate) struct Buffers {
     keys: Vec<Value>,
 }
 
+#[cold]
+#[inline(never)]
 fn type_error<T>(ctx: &Ctx, what: &str, v: &Value) -> EvalResult<T> {
     Err(EvalError::from(format!(
         "{what} expects a different type, found {} {}",
         v.type_name(),
         Show(ctx.symbols, v)
     )))
+}
+
+#[cold]
+#[inline(never)]
+fn unordered(symbols: &Symbols, a: &Value, b: &Value) -> EvalError {
+    EvalError::from(format!(
+        "cannot order {} and {}",
+        Show(symbols, a),
+        Show(symbols, b)
+    ))
 }
 
 fn index(ctx: &Ctx, len: usize, i: &Value, what: &str) -> EvalResult<Option<usize>> {
@@ -956,7 +993,19 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// Evaluates an expression. A value already stored is copied here, and
+    /// every operation goes through [`Ctx::compute`].
+    #[inline(always)]
     pub(crate) fn eval(&mut self, e: &Expr, state: &[Value], base: usize) -> EvalResult<Value> {
+        if simple(e) {
+            Ok(self.peek(e, state, base)?.clone())
+        } else {
+            self.compute(e, state, base)
+        }
+    }
+
+    #[inline(never)]
+    fn compute(&mut self, e: &Expr, state: &[Value], base: usize) -> EvalResult<Value> {
         Ok(match e {
             Expr::Lit(v) => v.clone(),
             Expr::Field(i) => state[*i].clone(),
@@ -1033,7 +1082,7 @@ impl<'a> Ctx<'a> {
             Expr::If(items) => {
                 let mut i = 0;
                 while i + 1 < items.len() {
-                    if self.truth(&items[i], state, base, "if")? {
+                    if self.test(&items[i], state, base, "if")? {
                         return self.eval(&items[i + 1], state, base);
                     }
                     i += 2;
@@ -1185,8 +1234,9 @@ impl<'a> Ctx<'a> {
                 op,
                 list,
                 slot,
+                indexed,
                 body,
-            } => self.iter(*op, list, *slot, body, state, base)?,
+            } => self.iter(*op, list, *slot, *indexed, body, state, base)?,
             Expr::Let(bindings, body) => {
                 for (slot, value) in bindings {
                     let v = self.eval(value, state, base)?;
@@ -1255,11 +1305,13 @@ impl<'a> Ctx<'a> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn iter(
         &mut self,
         op: IterOp,
         list: &Expr,
         slot: usize,
+        indexed: bool,
         body: &Expr,
         state: &[Value],
         base: usize,
@@ -1281,12 +1333,14 @@ impl<'a> Ctx<'a> {
         for step in 0..n {
             let i = if backwards { n - 1 - step } else { step };
             self.stack[base + slot] = item(i);
-            self.stack[base + slot + 1] = Value::Int(i as i64);
+            if indexed {
+                self.stack[base + slot + 1] = Value::Int(i as i64);
+            }
             match op {
                 IterOp::Map => mapped.push(self.eval(body, state, base)?),
                 IterOp::SortBy => keyed.push((self.eval(body, state, base)?, i)),
                 _ => {
-                    let hit = self.truth(body, state, base, "an iteration")?;
+                    let hit = self.test(body, state, base, "an iteration")?;
                     match op {
                         IterOp::Filter if hit => mapped.push(item(i)),
                         IterOp::Count if hit => count += 1,
@@ -1326,6 +1380,30 @@ impl<'a> Ctx<'a> {
 
     /// Evaluates a condition. Boolean operations, comparisons and literal
     /// membership answer here directly, reading simple operands in place.
+    /// Evaluates a condition. The commonest one, a comparison of two
+    /// stored values for equality, answers here without a call. Every
+    /// other condition goes through [`Ctx::truth`].
+    #[inline(always)]
+    pub(crate) fn test(
+        &mut self,
+        e: &Expr,
+        state: &[Value],
+        base: usize,
+        what: &str,
+    ) -> EvalResult<bool> {
+        match e {
+            Expr::Eq(l, r) if simple(l) && simple(r) => Ok(same(
+                self.peek(l, state, base)?,
+                self.peek(r, state, base)?,
+            )),
+            Expr::Ne(l, r) if simple(l) && simple(r) => Ok(!same(
+                self.peek(l, state, base)?,
+                self.peek(r, state, base)?,
+            )),
+            _ => self.truth(e, state, base, what),
+        }
+    }
+
     pub(crate) fn truth(
         &mut self,
         e: &Expr,
@@ -1336,7 +1414,7 @@ impl<'a> Ctx<'a> {
         match e {
             Expr::And(items) => {
                 for item in items {
-                    if !self.truth(item, state, base, "and")? {
+                    if !self.test(item, state, base, "and")? {
                         return Ok(false);
                     }
                 }
@@ -1344,26 +1422,26 @@ impl<'a> Ctx<'a> {
             }
             Expr::Or(items) => {
                 for item in items {
-                    if self.truth(item, state, base, "or")? {
+                    if self.test(item, state, base, "or")? {
                         return Ok(true);
                     }
                 }
                 Ok(false)
             }
-            Expr::Not(x) => Ok(!self.truth(x, state, base, "not")?),
-            Expr::Eq(l, r) => self.compare(l, r, state, base, |a, b| Ok(a == b)),
-            Expr::Ne(l, r) => self.compare(l, r, state, base, |a, b| Ok(a != b)),
+            Expr::Not(x) => Ok(!self.test(x, state, base, "not")?),
+            Expr::Eq(l, r) => self.compare(l, r, state, base, |a, b| Ok(same(a, b))),
+            Expr::Ne(l, r) => self.compare(l, r, state, base, |a, b| Ok(!same(a, b))),
             Expr::Cmp(ord, negate, l, r) => {
                 let symbols = self.symbols;
                 self.compare(l, r, state, base, |a, b| {
-                    if std::mem::discriminant(a) != std::mem::discriminant(b) {
-                        return Err(EvalError::from(format!(
-                            "cannot order {} and {}",
-                            Show(symbols, a),
-                            Show(symbols, b)
-                        )));
-                    }
-                    Ok((a.cmp(b) == *ord) != *negate)
+                    let order = match (a, b) {
+                        (Value::Int(a), Value::Int(b)) => a.cmp(b),
+                        _ if std::mem::discriminant(a) != std::mem::discriminant(b) => {
+                            return Err(unordered(symbols, a, b));
+                        }
+                        _ => a.cmp(b),
+                    };
+                    Ok((order == *ord) != *negate)
                 })
             }
             Expr::InLit(x, items) => {
@@ -1419,29 +1497,39 @@ impl<'a> Ctx<'a> {
     }
 
     /// Reads a [`simple`] expression in place.
+    #[inline(always)]
     fn peek<'s>(&'s self, e: &'s Expr, state: &'s [Value], base: usize) -> EvalResult<&'s Value> {
-        let local = |l: &usize| &self.stack[base + l];
-        Ok(match e {
-            Expr::Lit(v) => v,
-            Expr::Field(f) => &state[*f],
-            Expr::Local(l) => local(l),
-            Expr::Path(root, keys, hints) => {
-                let mut cur = match root {
-                    Root::Field(f) => &state[*f],
-                    Root::Local(l) => local(l),
-                };
-                for (k, found) in keys.iter().zip(&hints.found) {
-                    let key = match k {
-                        Expr::Lit(v) => v,
-                        Expr::Local(l) => local(l),
-                        _ => unreachable!("peek on a path with a computed key"),
-                    };
-                    cur = step(self.symbols, cur, key, found)?;
-                }
-                cur
-            }
+        match e {
+            Expr::Lit(v) => Ok(v),
+            Expr::Field(f) => Ok(&state[*f]),
+            Expr::Local(l) => Ok(&self.stack[base + l]),
+            Expr::Path(root, keys, hints) => self.follow(*root, keys, hints, state, base),
             _ => unreachable!("peek on an expression that is not simple"),
-        })
+        }
+    }
+
+    /// Reads a path whose keys are literals or locals.
+    fn follow<'s>(
+        &'s self,
+        root: Root,
+        keys: &'s [Expr],
+        hints: &'s Hints,
+        state: &'s [Value],
+        base: usize,
+    ) -> EvalResult<&'s Value> {
+        let mut cur = match root {
+            Root::Field(f) => &state[f],
+            Root::Local(l) => &self.stack[base + l],
+        };
+        for (k, found) in keys.iter().zip(&hints.found) {
+            let key = match k {
+                Expr::Lit(v) => v,
+                Expr::Local(l) => &self.stack[base + l],
+                _ => unreachable!("a simple path with a computed key"),
+            };
+            cur = step(self.symbols, cur, key, found)?;
+        }
+        Ok(cur)
     }
 
     fn int(&mut self, e: &Expr, state: &[Value], base: usize, what: &str) -> EvalResult<i64> {
@@ -1521,7 +1609,7 @@ impl<'a> Ctx<'a> {
                     self.keys = keys;
                 }
                 Effect::If(cond, then, otherwise) => {
-                    let branch = if self.truth(cond, state, base, "if")? {
+                    let branch = if self.test(cond, state, base, "if")? {
                         then
                     } else {
                         otherwise
