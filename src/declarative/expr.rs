@@ -3,6 +3,7 @@
 use super::value::{Hashed, Show, Sym, Symbols, Value};
 use std::cmp::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
 /// A compiled expression. Names are resolved at compile time: a state field
 /// to its slot in the state, a local name to its slot in the current frame.
@@ -16,7 +17,7 @@ pub(crate) enum Expr {
     Get(Box<Expr>, Box<Expr>, Option<Box<Expr>>),
     /// `get` chains on a state field or a local, read by reference so the
     /// lists and records along the way are not copied.
-    Path(Root, Vec<Expr>),
+    Path(Root, Vec<Expr>, Hints),
     Len(Box<Expr>),
     If(Vec<Expr>),
     And(Vec<Expr>),
@@ -45,6 +46,30 @@ pub(crate) enum Expr {
     },
     Let(Vec<(usize, Expr)>, Box<Expr>),
     Call(usize, Vec<Expr>),
+}
+
+/// What compilation and earlier evaluations learned about a [`Expr::Path`].
+#[derive(Debug, Default)]
+pub(crate) struct Hints {
+    /// Whether every key is a literal or a local, so the path can be read
+    /// in place. See [`simple`].
+    simple: bool,
+    /// For each key, the position where a record last had it. Records built
+    /// by the same expression have the same fields, so the position is
+    /// usually right and saves the search. Threads may race to store it,
+    /// and a stale position only costs the search.
+    found: Vec<AtomicU32>,
+}
+
+impl Hints {
+    fn of(keys: &[Expr]) -> Hints {
+        Hints {
+            simple: keys
+                .iter()
+                .all(|k| matches!(k, Expr::Lit(_) | Expr::Local(_))),
+            found: keys.iter().map(|_| AtomicU32::new(0)).collect(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -356,11 +381,11 @@ pub(crate) fn compile(scope: &mut Scope, json: &Json, at: &str) -> Result<Expr, 
             let x = compile(scope, &a[0], at)?;
             let k = compile(scope, &a[1], at)?;
             match (x, a.get(2)) {
-                (Expr::Field(f), None) => Expr::Path(Root::Field(f), vec![k]),
-                (Expr::Local(l), None) => Expr::Path(Root::Local(l), vec![k]),
-                (Expr::Path(root, mut keys), None) => {
+                (Expr::Field(f), None) => path(Root::Field(f), vec![k]),
+                (Expr::Local(l), None) => path(Root::Local(l), vec![k]),
+                (Expr::Path(root, mut keys, _), None) => {
                     keys.push(k);
-                    Expr::Path(root, keys)
+                    path(root, keys)
                 }
                 (x, default) => Expr::Get(
                     Box::new(x),
@@ -519,8 +544,19 @@ pub(crate) fn compile(scope: &mut Scope, json: &Json, at: &str) -> Result<Expr, 
     Ok(e)
 }
 
-/// Reads one key of a list or a record by reference.
-fn step<'v>(symbols: &Symbols, cur: &'v Value, key: &Value) -> EvalResult<&'v Value> {
+fn path(root: Root, keys: Vec<Expr>) -> Expr {
+    let hints = Hints::of(&keys);
+    Expr::Path(root, keys, hints)
+}
+
+/// Reads one key of a list or a record by reference. `found` is the
+/// position where a record last had the key at this place in the model.
+fn step<'v>(
+    symbols: &Symbols,
+    cur: &'v Value,
+    key: &Value,
+    found: &AtomicU32,
+) -> EvalResult<&'v Value> {
     let next = match (cur, key) {
         (Value::List(l), Value::Int(i)) => {
             let n = l.len() as i64;
@@ -528,7 +564,13 @@ fn step<'v>(symbols: &Symbols, cur: &'v Value, key: &Value) -> EvalResult<&'v Va
             (0..n).contains(&i).then(|| &l[i as usize])
         }
         (Value::Rec(r), Value::Str(s)) => {
-            r.binary_search_by_key(s, |(k, _)| *k).ok().map(|i| &r[i].1)
+            match r.get(found.load(AtomicOrdering::Relaxed) as usize) {
+                Some((k, v)) if k == s => Some(v),
+                _ => r.binary_search_by_key(s, |(k, _)| *k).ok().map(|i| {
+                    found.store(i as u32, AtomicOrdering::Relaxed);
+                    &r[i].1
+                }),
+            }
         }
         _ => None,
     };
@@ -543,12 +585,11 @@ fn step<'v>(symbols: &Symbols, cur: &'v Value, key: &Value) -> EvalResult<&'v Va
 
 /// Whether an expression reads a value already stored: a literal, a state
 /// field, a local, or a path whose keys are literals or locals.
+#[inline]
 fn simple(e: &Expr) -> bool {
     match e {
         Expr::Lit(_) | Expr::Field(_) | Expr::Local(_) => true,
-        Expr::Path(_, keys) => keys
-            .iter()
-            .all(|k| matches!(k, Expr::Lit(_) | Expr::Local(_))),
+        Expr::Path(_, _, hints) => hints.simple,
         _ => false,
     }
 }
@@ -575,7 +616,7 @@ pub(crate) fn binding<'j>(json: &'j Json, at: &str) -> Result<(&'j str, &'j Json
     }
 }
 
-fn path(scope: &mut Scope, json: &Json, at: &str) -> Result<(usize, Vec<Expr>), String> {
+fn target(scope: &mut Scope, json: &Json, at: &str) -> Result<(usize, Vec<Expr>), String> {
     let (field, rest) = match json {
         Json::String(f) => (f.as_str(), &[][..]),
         Json::Array(items) if !items.is_empty() => match &items[0] {
@@ -620,18 +661,18 @@ pub(crate) fn compile_effects(
             return Err(format!("{at}: an effect is an object"));
         };
         let effect = if let Some(p) = fields.get("set") {
-            let (field, path) = path(scope, p, at)?;
+            let (field, path) = target(scope, p, at)?;
             let value = compile(scope, get(fields, "to", at)?, at)?;
             Effect::Set { field, path, value }
         } else if let Some(p) = fields.get("append") {
-            let (field, path) = path(scope, p, at)?;
+            let (field, path) = target(scope, p, at)?;
             let value = compile(scope, get(fields, "value", at)?, at)?;
             Effect::Append { field, path, value }
         } else if let Some(p) = fields.get("clear") {
-            let (field, path) = path(scope, p, at)?;
+            let (field, path) = target(scope, p, at)?;
             Effect::Clear { field, path }
         } else if let Some(p) = fields.get("remove") {
-            let (field, path) = path(scope, p, at)?;
+            let (field, path) = target(scope, p, at)?;
             let at_index = compile(scope, get(fields, "at", at)?, at)?;
             Effect::Remove {
                 field,
@@ -673,6 +714,143 @@ pub(crate) fn compile_effects(
     }
     scope.release(mark);
     Ok(out)
+}
+
+/// Calls `f` on each direct subexpression of `e`.
+fn each_child<'e>(e: &'e Expr, f: &mut impl FnMut(&'e Expr)) {
+    match e {
+        Expr::Lit(_) | Expr::Field(_) | Expr::Local(_) => {}
+        Expr::List(items)
+        | Expr::Path(_, items, _)
+        | Expr::If(items)
+        | Expr::And(items)
+        | Expr::Or(items)
+        | Expr::Arith(_, items)
+        | Expr::Concat(items)
+        | Expr::Call(_, items) => items.iter().for_each(f),
+        Expr::Rec(fields) => fields.iter().for_each(|(_, v)| f(v)),
+        Expr::Len(x) | Expr::Not(x) | Expr::InLit(x, _) => f(x),
+        Expr::Eq(a, b)
+        | Expr::Ne(a, b)
+        | Expr::Cmp(_, _, a, b)
+        | Expr::In(a, b)
+        | Expr::IndexOf(a, b)
+        | Expr::Range(a, b)
+        | Expr::SetOp(_, a, b)
+        | Expr::Subset(a, b) => {
+            f(a);
+            f(b);
+        }
+        Expr::Get(a, b, c) | Expr::Slice(a, b, c) => {
+            f(a);
+            f(b);
+            if let Some(c) = c {
+                f(c);
+            }
+        }
+        Expr::SetAt(a, b, c) | Expr::With(a, b, c) => {
+            f(a);
+            f(b);
+            f(c);
+        }
+        Expr::Iter { list, body, .. } => {
+            f(list);
+            f(body);
+        }
+        Expr::Let(bindings, body) => {
+            bindings.iter().for_each(|(_, v)| f(v));
+            f(body);
+        }
+    }
+}
+
+/// The state fields a piece of a model reads and the ones it changes, as
+/// one flag per field. A piece that reads only some fields gives the same
+/// result in every state that agrees on them.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Access {
+    pub(crate) reads: Vec<bool>,
+    pub(crate) writes: Vec<bool>,
+}
+
+impl Access {
+    pub(crate) fn none(fields: usize) -> Access {
+        Access {
+            reads: vec![false; fields],
+            writes: vec![false; fields],
+        }
+    }
+
+    pub(crate) fn merge(&mut self, other: &Access) {
+        for (mine, theirs) in self.reads.iter_mut().zip(&other.reads) {
+            *mine |= theirs;
+        }
+        for (mine, theirs) in self.writes.iter_mut().zip(&other.writes) {
+            *mine |= theirs;
+        }
+    }
+
+    /// Marks the fields `e` reads. `def_reads` gives the fields each def
+    /// reads, the defs it calls included.
+    pub(crate) fn expr(&mut self, e: &Expr, def_reads: &[Vec<bool>]) {
+        match e {
+            Expr::Field(f) | Expr::Path(Root::Field(f), ..) => self.reads[*f] = true,
+            Expr::Call(def, _) => {
+                for (mine, theirs) in self.reads.iter_mut().zip(&def_reads[*def]) {
+                    *mine |= theirs;
+                }
+            }
+            _ => {}
+        }
+        each_child(e, &mut |child| self.expr(child, def_reads));
+    }
+
+    /// Marks the fields `effects` read and change. A field an effect may
+    /// change counts as read too: part of it can stay as it was, and so can
+    /// all of it when the effect is in a branch not taken.
+    pub(crate) fn effects(&mut self, effects: &[Effect], def_reads: &[Vec<bool>]) {
+        for effect in effects {
+            match effect {
+                Effect::Set { field, path, value } | Effect::Append { field, path, value } => {
+                    self.change(*field, path, def_reads);
+                    self.expr(value, def_reads);
+                }
+                Effect::Clear { field, path } => self.change(*field, path, def_reads),
+                Effect::Remove { field, path, at } => {
+                    self.change(*field, path, def_reads);
+                    self.expr(at, def_reads);
+                }
+                Effect::If(cond, then, otherwise) => {
+                    self.expr(cond, def_reads);
+                    self.effects(then, def_reads);
+                    self.effects(otherwise, def_reads);
+                }
+                Effect::Let(_, value) => self.expr(value, def_reads),
+                Effect::Require(cond) => self.expr(cond, def_reads),
+                Effect::Violate(_) => {}
+            }
+        }
+    }
+
+    fn change(&mut self, field: usize, path: &[Expr], def_reads: &[Vec<bool>]) {
+        self.reads[field] = true;
+        self.writes[field] = true;
+        path.iter().for_each(|k| self.expr(k, def_reads));
+    }
+}
+
+/// The fields each def reads, the defs it calls included. Defs do not
+/// recurse, so repeating the pass once per def follows every chain of calls.
+pub(crate) fn def_reads(defs: &[Def], fields: usize) -> Vec<Vec<bool>> {
+    let mut reads = vec![vec![false; fields]; defs.len()];
+    for _ in 0..defs.len() {
+        for (i, def) in defs.iter().enumerate() {
+            let mut access = Access::none(fields);
+            access.expr(&def.body, &reads);
+            reads[i] = access.reads;
+        }
+    }
+    reads
 }
 
 /// Evaluation context: the state the expressions read, the defs, and a stack
@@ -769,8 +947,8 @@ impl Ctx<'_> {
                     }
                 }
             }
-            Expr::Path(root, keys) => {
-                if simple(e) {
+            Expr::Path(root, keys, hints) => {
+                if hints.simple {
                     self.peek(e, state, base)?.clone()
                 } else {
                     let mut evaluated = Vec::with_capacity(keys.len());
@@ -781,17 +959,26 @@ impl Ctx<'_> {
                         Root::Field(f) => &state[*f],
                         Root::Local(l) => &self.stack[base + l],
                     };
-                    for key in &evaluated {
-                        cur = step(self.symbols, cur, key)?;
+                    for (key, found) in evaluated.iter().zip(&hints.found) {
+                        cur = step(self.symbols, cur, key, found)?;
                     }
                     cur.clone()
                 }
             }
-            Expr::Len(x) => match self.eval(x, state, base)? {
-                Value::List(l) => Value::Int(l.len() as i64),
-                Value::Rec(r) => Value::Int(r.len() as i64),
-                v => return type_error(self, "len", &v),
-            },
+            Expr::Len(x) => {
+                let held;
+                let v = if simple(x) {
+                    self.peek(x, state, base)?
+                } else {
+                    held = self.eval(x, state, base)?;
+                    &held
+                };
+                match v {
+                    Value::List(l) => Value::Int(l.len() as i64),
+                    Value::Rec(r) => Value::Int(r.len() as i64),
+                    v => return type_error(self, "len", v),
+                }
+            }
             Expr::If(items) => {
                 let mut i = 0;
                 while i + 1 < items.len() {
@@ -1149,6 +1336,9 @@ impl Ctx<'_> {
         base: usize,
         f: impl FnOnce(&Value, &Value) -> EvalResult<bool>,
     ) -> EvalResult<bool> {
+        if simple(l) && simple(r) {
+            return f(self.peek(l, state, base)?, self.peek(r, state, base)?);
+        }
         let lo = if simple(l) {
             None
         } else {
@@ -1177,18 +1367,18 @@ impl Ctx<'_> {
             Expr::Lit(v) => v,
             Expr::Field(f) => &state[*f],
             Expr::Local(l) => local(l),
-            Expr::Path(root, keys) => {
+            Expr::Path(root, keys, hints) => {
                 let mut cur = match root {
                     Root::Field(f) => &state[*f],
                     Root::Local(l) => local(l),
                 };
-                for k in keys {
+                for (k, found) in keys.iter().zip(&hints.found) {
                     let key = match k {
                         Expr::Lit(v) => v,
                         Expr::Local(l) => local(l),
                         _ => unreachable!("peek on a path with a computed key"),
                     };
-                    cur = step(self.symbols, cur, key)?;
+                    cur = step(self.symbols, cur, key, found)?;
                 }
                 cur
             }
@@ -1197,10 +1387,16 @@ impl Ctx<'_> {
     }
 
     fn int(&mut self, e: &Expr, state: &[Value], base: usize, what: &str) -> EvalResult<i64> {
-        let v = self.eval(e, state, base)?;
+        let held;
+        let v = if simple(e) {
+            self.peek(e, state, base)?
+        } else {
+            held = self.eval(e, state, base)?;
+            &held
+        };
         match v.as_int() {
             Some(i) => Ok(i),
-            None => type_error(self, what, &v),
+            None => type_error(self, what, v),
         }
     }
 
