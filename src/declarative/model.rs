@@ -5,7 +5,7 @@ use super::value::{Symbols, Value, collect_strings};
 use crate::{Model, Property};
 use dashmap::DashSet;
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// The schema version this crate reads, in the document's `"stateright"` key.
 pub const SCHEMA_VERSION: i64 = 1;
@@ -64,6 +64,9 @@ pub(crate) struct Action {
     lets: Vec<(usize, Expr)>,
     guard: Option<Expr>,
     effects: Vec<Effect>,
+    /// False when the action keeps a normalized state normalized, so the
+    /// model's `normalize` effects can be skipped after it.
+    normalize: bool,
     frame: usize,
 }
 
@@ -398,25 +401,56 @@ impl JsonModel {
             symbols: &self.symbols,
             defs: &self.defs,
             stack: vec![Value::Null; frame],
+            memo: Vec::new(),
         }
     }
 
     fn holds(&self, i: usize, state: &JsonState) -> bool {
-        let inv = &self.invariants[i];
-        match inv.kind {
-            Kind::Transition(bit) => state.violated & (1 << bit) == 0,
-            Kind::Always | Kind::Sometimes => {
-                let expr = inv.expr.as_ref().unwrap();
-                let mut ctx = self.ctx(inv.frame);
-                match ctx.truth(expr, &state.fields, 0, inv.name) {
+        if let Kind::Transition(bit) = self.invariants[i].kind {
+            return state.violated & (1 << bit) == 0;
+        }
+        // The checker asks for each invariant of a state in turn. The first
+        // question evaluates them all with one context, so zero-argument
+        // defs they share run once, and the rest read the cached answers.
+        let key = self as *const JsonModel as usize;
+        CHECKED.with(|cell| {
+            let mut cached = cell.borrow_mut();
+            if let Some((model, fields, results)) = cached.as_ref()
+                && *model == key
+                && same_object(fields, &state.fields)
+            {
+                return results[i];
+            }
+            let results = self.evaluate_invariants(state);
+            let answer = results[i];
+            *cached = Some((key, state.fields.clone(), results));
+            answer
+        })
+    }
+
+    fn evaluate_invariants(&self, state: &JsonState) -> Vec<bool> {
+        let frame = self
+            .invariants
+            .iter()
+            .map(|inv| inv.frame)
+            .max()
+            .unwrap_or(0);
+        let mut ctx = self.ctx(frame);
+        ctx.memo = vec![None; self.defs.len().max(1)];
+        self.invariants
+            .iter()
+            .map(|inv| match (&inv.kind, &inv.expr) {
+                (Kind::Transition(bit), _) => state.violated & (1 << bit) == 0,
+                (_, Some(expr)) => match ctx.truth(expr, &state.fields, 0, inv.name) {
                     Ok(b) => b,
                     Err(e) => {
                         self.fail(format!("invariant {:?}: {e}", inv.name));
                         true
                     }
-                }
-            }
-        }
+                },
+                (_, None) => true,
+            })
+            .collect()
     }
 
     fn enabled(&self, state: &JsonState, out: &mut Vec<JsonAction>) -> Result<(), String> {
@@ -467,7 +501,7 @@ impl JsonModel {
         if !ctx.apply(&action.effects, &mut next, &mut violated, 0)? {
             return Ok(());
         }
-        if !self.normalize.is_empty() {
+        if action.normalize && !self.normalize.is_empty() {
             let mut ignored = 0;
             if !nctx
                 .apply(&self.normalize, &mut next, &mut ignored, 0)
@@ -513,7 +547,7 @@ fn compile_action(
     for key in a.keys() {
         if !matches!(
             key.as_str(),
-            "name" | "for" | "let" | "guard" | "effects" | "description"
+            "name" | "for" | "let" | "guard" | "effects" | "normalize" | "description"
         ) {
             return Err(format!("{at}: unknown key {key:?}"));
         }
@@ -547,12 +581,18 @@ fn compile_action(
         None => Vec::new(),
         Some(e) => compile_effects(&mut scope, e, &format!("{at}.effects"))?,
     };
+    let normalize = match a.get("normalize") {
+        None => true,
+        Some(Json::Bool(b)) => *b,
+        Some(_) => return Err(format!("{at}.normalize: expected true or false")),
+    };
     Ok(Action {
         name,
         params,
         lets,
         guard,
         effects,
+        normalize,
         frame: scope.frame(),
     })
 }
@@ -621,6 +661,28 @@ impl Model for JsonModel {
     fn properties(&self) -> Vec<Property<Self>> {
         self.properties.clone()
     }
+}
+
+thread_local! {
+    /// The invariant answers for the state this thread checked last.
+    static CHECKED: std::cell::RefCell<Option<Checked>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A model's address, a state's fields, and one answer per invariant.
+type Checked = (usize, Vec<Value>, Vec<bool>);
+
+/// Whether two states are the same object: every list and record is the
+/// same allocation and every scalar is equal. The cache keeps its copy of
+/// the fields alive, so an address it compares can't be reused by another
+/// state while the entry exists.
+fn same_object(a: &[Value], b: &[Value]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| match (x, y) {
+            (Value::List(x), Value::List(y)) => Arc::ptr_eq(x, y),
+            (Value::Rec(x), Value::Rec(y)) => Arc::ptr_eq(x, y),
+            (Value::List(_) | Value::Rec(_), _) | (_, Value::List(_) | Value::Rec(_)) => false,
+            (x, y) => x == y,
+        })
 }
 
 /// One condition function per invariant slot. [`Property`] takes a plain

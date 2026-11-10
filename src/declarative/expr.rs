@@ -146,8 +146,37 @@ impl Domain {
 }
 
 /// An evaluation error: a type error, an index out of range, an overflow.
-/// These are errors in the model, not in the system it describes.
-pub(crate) type EvalResult<T> = Result<T, String>;
+/// These are errors in the model, not in the system it describes. The
+/// message is boxed so a result fits in two machine words.
+#[derive(Debug)]
+#[allow(clippy::box_collection)] // a thin pointer, where `String` would take three words
+pub(crate) struct EvalError(Box<String>);
+
+impl From<String> for EvalError {
+    fn from(message: String) -> Self {
+        EvalError(Box::new(message))
+    }
+}
+
+impl From<&str> for EvalError {
+    fn from(message: &str) -> Self {
+        EvalError(Box::new(message.to_string()))
+    }
+}
+
+impl std::fmt::Display for EvalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<EvalError> for String {
+    fn from(error: EvalError) -> Self {
+        *error.0
+    }
+}
+
+pub(crate) type EvalResult<T> = Result<T, EvalError>;
 
 /// The names visible while compiling one frame: state fields, then the
 /// locals bound so far.
@@ -503,7 +532,25 @@ fn step<'v>(symbols: &Symbols, cur: &'v Value, key: &Value) -> EvalResult<&'v Va
         }
         _ => None,
     };
-    next.ok_or_else(|| format!("get: no {} in {}", Show(symbols, key), Show(symbols, cur)))
+    next.ok_or_else(|| {
+        EvalError::from(format!(
+            "get: no {} in {}",
+            Show(symbols, key),
+            Show(symbols, cur)
+        ))
+    })
+}
+
+/// Whether an expression reads a value already stored: a literal, a state
+/// field, a local, or a path whose keys are literals or locals.
+fn simple(e: &Expr) -> bool {
+    match e {
+        Expr::Lit(_) | Expr::Field(_) | Expr::Local(_) => true,
+        Expr::Path(_, keys) => keys
+            .iter()
+            .all(|k| matches!(k, Expr::Lit(_) | Expr::Local(_))),
+        _ => false,
+    }
 }
 
 /// The values of a list of expressions, when every one is a literal.
@@ -634,14 +681,17 @@ pub(crate) struct Ctx<'a> {
     pub(crate) symbols: &'a Symbols,
     pub(crate) defs: &'a [Def],
     pub(crate) stack: Vec<Value>,
+    /// Values of zero-argument defs for the one state this context reads.
+    /// Empty when the context evaluates against a state that effects change.
+    pub(crate) memo: Vec<Option<Value>>,
 }
 
 fn type_error<T>(ctx: &Ctx, what: &str, v: &Value) -> EvalResult<T> {
-    Err(format!(
+    Err(EvalError::from(format!(
         "{what} expects a different type, found {} {}",
         v.type_name(),
         Show(ctx.symbols, v)
-    ))
+    )))
 }
 
 fn index(ctx: &Ctx, len: usize, i: &Value, what: &str) -> EvalResult<Option<usize>> {
@@ -658,7 +708,7 @@ fn index(ctx: &Ctx, len: usize, i: &Value, what: &str) -> EvalResult<Option<usiz
 
 fn floor_div(a: i64, b: i64) -> EvalResult<(i64, i64)> {
     if b == 0 {
-        return Err("division by zero".into());
+        return Err(EvalError::from("division by zero"));
     }
     let q = a.checked_div(b).ok_or("integer overflow")?;
     let r = a - q * b;
@@ -711,34 +761,17 @@ impl Ctx<'_> {
                     (Some(v), _) => v,
                     (None, Some(d)) => self.eval(d, state, base)?,
                     (None, None) => {
-                        return Err(format!(
+                        return Err(EvalError::from(format!(
                             "get: no {} in {}",
                             Show(self.symbols, &k),
                             Show(self.symbols, &x)
-                        ));
+                        )));
                     }
                 }
             }
             Expr::Path(root, keys) => {
-                if keys
-                    .iter()
-                    .all(|k| matches!(k, Expr::Lit(_) | Expr::Local(_)))
-                {
-                    // Keys that are literals or locals are read in place.
-                    let stack = &self.stack;
-                    let mut cur = match root {
-                        Root::Field(f) => &state[*f],
-                        Root::Local(l) => &stack[base + l],
-                    };
-                    for k in keys {
-                        let key = match k {
-                            Expr::Lit(v) => v,
-                            Expr::Local(l) => &stack[base + l],
-                            _ => unreachable!(),
-                        };
-                        cur = step(self.symbols, cur, key)?;
-                    }
-                    cur.clone()
+                if simple(e) {
+                    self.peek(e, state, base)?.clone()
                 } else {
                     let mut evaluated = Vec::with_capacity(keys.len());
                     for k in keys {
@@ -769,36 +802,13 @@ impl Ctx<'_> {
                 }
                 self.eval(&items[items.len() - 1], state, base)?
             }
-            Expr::And(items) => {
-                for item in items {
-                    if !self.truth(item, state, base, "and")? {
-                        return Ok(Value::Bool(false));
-                    }
-                }
-                Value::Bool(true)
-            }
-            Expr::Or(items) => {
-                for item in items {
-                    if self.truth(item, state, base, "or")? {
-                        return Ok(Value::Bool(true));
-                    }
-                }
-                Value::Bool(false)
-            }
-            Expr::Not(x) => Value::Bool(!self.truth(x, state, base, "not")?),
-            Expr::Eq(l, r) => Value::Bool(self.eval(l, state, base)? == self.eval(r, state, base)?),
-            Expr::Ne(l, r) => Value::Bool(self.eval(l, state, base)? != self.eval(r, state, base)?),
-            Expr::Cmp(ord, negate, l, r) => {
-                let (l, r) = (self.eval(l, state, base)?, self.eval(r, state, base)?);
-                if std::mem::discriminant(&l) != std::mem::discriminant(&r) {
-                    return Err(format!(
-                        "cannot order {} and {}",
-                        Show(self.symbols, &l),
-                        Show(self.symbols, &r)
-                    ));
-                }
-                Value::Bool((l.cmp(&r) == *ord) != *negate)
-            }
+            Expr::And(_)
+            | Expr::Or(_)
+            | Expr::Not(_)
+            | Expr::Eq(..)
+            | Expr::Ne(..)
+            | Expr::Cmp(..)
+            | Expr::InLit(..) => Value::Bool(self.truth(e, state, base, "a condition")?),
             Expr::Arith(op, items) => {
                 let mut acc = self.int(&items[0], state, base, "arithmetic")?;
                 for item in &items[1..] {
@@ -824,10 +834,6 @@ impl Ctx<'_> {
                     },
                     v => return type_error(self, "index_of", &v),
                 }
-            }
-            Expr::InLit(x, items) => {
-                let x = self.eval(x, state, base)?;
-                Value::Bool(items.contains(&x))
             }
             Expr::In(x, l) => {
                 let x = self.eval(x, state, base)?;
@@ -879,10 +885,10 @@ impl Ctx<'_> {
                     return type_error(self, "set_at", &list);
                 };
                 let Some(i) = index(self, items.len(), &i, "set_at")? else {
-                    return Err(format!(
+                    return Err(EvalError::from(format!(
                         "set_at: index {} out of range",
                         Show(self.symbols, &i)
-                    ));
+                    )));
                 };
                 Arc::make_mut(&mut items)[i] = v;
                 Value::List(items)
@@ -950,34 +956,50 @@ impl Ctx<'_> {
                 }
                 self.eval(body, state, base)?
             }
-            Expr::Call(def, args) => {
-                let def_ref = &self.defs[*def];
-                if args.len() != def_ref.arity {
-                    return Err(format!(
-                        "call {}: takes {} arguments, found {}",
-                        def_ref.name,
-                        def_ref.arity,
-                        args.len()
-                    ));
+            Expr::Call(def, args) if args.is_empty() && !self.memo.is_empty() => {
+                if let Some(v) = &self.memo[*def] {
+                    return Ok(v.clone());
                 }
-                let frame = def_ref.frame;
-                let new_base = self.stack.len();
-                for a in args {
-                    match self.eval(a, state, base) {
-                        Ok(v) => self.stack.push(v),
-                        Err(e) => {
-                            self.stack.truncate(new_base);
-                            return Err(e);
-                        }
-                    }
-                }
-                self.stack.resize(new_base + frame, Value::Null);
-                let defs = self.defs;
-                let result = self.eval(&defs[*def].body, state, new_base);
-                self.stack.truncate(new_base);
-                result?
+                let v = self.call(*def, args, state, base)?;
+                self.memo[*def] = Some(v.clone());
+                v
             }
+            Expr::Call(def, args) => self.call(*def, args, state, base)?,
         })
+    }
+
+    fn call(
+        &mut self,
+        def: usize,
+        args: &[Expr],
+        state: &[Value],
+        base: usize,
+    ) -> EvalResult<Value> {
+        let def_ref = &self.defs[def];
+        if args.len() != def_ref.arity {
+            return Err(EvalError::from(format!(
+                "call {}: takes {} arguments, found {}",
+                def_ref.name,
+                def_ref.arity,
+                args.len()
+            )));
+        }
+        let frame = def_ref.frame;
+        let new_base = self.stack.len();
+        for a in args {
+            match self.eval(a, state, base) {
+                Ok(v) => self.stack.push(v),
+                Err(e) => {
+                    self.stack.truncate(new_base);
+                    return Err(e);
+                }
+            }
+        }
+        self.stack.resize(new_base + frame, Value::Null);
+        let defs = self.defs;
+        let result = self.eval(&defs[def].body, state, new_base);
+        self.stack.truncate(new_base);
+        result
     }
 
     /// Evaluates the list an iteration or a parameter ranges over.
@@ -1057,6 +1079,8 @@ impl Ctx<'_> {
         })
     }
 
+    /// Evaluates a condition. Boolean operations, comparisons and literal
+    /// membership answer here directly, reading simple operands in place.
     pub(crate) fn truth(
         &mut self,
         e: &Expr,
@@ -1064,11 +1088,112 @@ impl Ctx<'_> {
         base: usize,
         what: &str,
     ) -> EvalResult<bool> {
-        let v = self.eval(e, state, base)?;
-        match v.as_bool() {
-            Some(b) => Ok(b),
-            None => type_error(self, what, &v),
+        match e {
+            Expr::And(items) => {
+                for item in items {
+                    if !self.truth(item, state, base, "and")? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            Expr::Or(items) => {
+                for item in items {
+                    if self.truth(item, state, base, "or")? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            Expr::Not(x) => Ok(!self.truth(x, state, base, "not")?),
+            Expr::Eq(l, r) => self.compare(l, r, state, base, |a, b| Ok(a == b)),
+            Expr::Ne(l, r) => self.compare(l, r, state, base, |a, b| Ok(a != b)),
+            Expr::Cmp(ord, negate, l, r) => {
+                let symbols = self.symbols;
+                self.compare(l, r, state, base, |a, b| {
+                    if std::mem::discriminant(a) != std::mem::discriminant(b) {
+                        return Err(EvalError::from(format!(
+                            "cannot order {} and {}",
+                            Show(symbols, a),
+                            Show(symbols, b)
+                        )));
+                    }
+                    Ok((a.cmp(b) == *ord) != *negate)
+                })
+            }
+            Expr::InLit(x, items) => {
+                if simple(x) {
+                    Ok(items.contains(self.peek(x, state, base)?))
+                } else {
+                    let x = self.eval(x, state, base)?;
+                    Ok(items.contains(&x))
+                }
+            }
+            Expr::Lit(Value::Bool(b)) => Ok(*b),
+            _ => {
+                let v = self.eval(e, state, base)?;
+                match v.as_bool() {
+                    Some(b) => Ok(b),
+                    None => type_error(self, what, &v),
+                }
+            }
         }
+    }
+
+    /// Applies `f` to two operands, reading simple ones in place.
+    fn compare(
+        &mut self,
+        l: &Expr,
+        r: &Expr,
+        state: &[Value],
+        base: usize,
+        f: impl FnOnce(&Value, &Value) -> EvalResult<bool>,
+    ) -> EvalResult<bool> {
+        let lo = if simple(l) {
+            None
+        } else {
+            Some(self.eval(l, state, base)?)
+        };
+        let ro = if simple(r) {
+            None
+        } else {
+            Some(self.eval(r, state, base)?)
+        };
+        let lv = match &lo {
+            Some(v) => v,
+            None => self.peek(l, state, base)?,
+        };
+        let rv = match &ro {
+            Some(v) => v,
+            None => self.peek(r, state, base)?,
+        };
+        f(lv, rv)
+    }
+
+    /// Reads a [`simple`] expression in place.
+    fn peek<'s>(&'s self, e: &'s Expr, state: &'s [Value], base: usize) -> EvalResult<&'s Value> {
+        let local = |l: &usize| &self.stack[base + l];
+        Ok(match e {
+            Expr::Lit(v) => v,
+            Expr::Field(f) => &state[*f],
+            Expr::Local(l) => local(l),
+            Expr::Path(root, keys) => {
+                let mut cur = match root {
+                    Root::Field(f) => &state[*f],
+                    Root::Local(l) => local(l),
+                };
+                for k in keys {
+                    let key = match k {
+                        Expr::Lit(v) => v,
+                        Expr::Local(l) => local(l),
+                        _ => unreachable!("peek on a path with a computed key"),
+                    };
+                    cur = step(self.symbols, cur, key)?;
+                }
+                cur
+            }
+            _ => unreachable!("peek on an expression that is not simple"),
+        })
     }
 
     fn int(&mut self, e: &Expr, state: &[Value], base: usize, what: &str) -> EvalResult<i64> {
@@ -1129,10 +1254,10 @@ impl Ctx<'_> {
                                 Arc::make_mut(l).remove(i);
                                 Ok(())
                             }
-                            None => Err(format!(
+                            None => Err(EvalError::from(format!(
                                 "remove: index {} out of range",
                                 Show(ctx.symbols, &at)
-                            )),
+                            ))),
                         },
                         other => type_error(ctx, "remove", other),
                     })?;
@@ -1179,7 +1304,10 @@ impl Ctx<'_> {
             slot = match (slot, k) {
                 (Value::List(l), _) => {
                     let Some(i) = index(self, l.len(), k, "a path")? else {
-                        return Err(format!("path index {} out of range", Show(self.symbols, k)));
+                        return Err(EvalError::from(format!(
+                            "path index {} out of range",
+                            Show(self.symbols, k)
+                        )));
                     };
                     &mut Arc::make_mut(l)[i]
                 }

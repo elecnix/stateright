@@ -177,7 +177,10 @@ class Model:
     def define(self, name, params, body):
         self.doc["defs"][name] = {"params": list(params), "body": body}
 
-    def action(self, name, params=(), lets=(), guard=None, effects=()):
+    def action(self, name, params=(), lets=(), guard=None, effects=(), normalize=True):
+        """`normalize=False` skips the model's normalize effects after this
+        action. Use it only when the action keeps a normalized state
+        normalized."""
         a = {"name": name}
         if params:
             a["for"] = [[n, d] for n, d in params]
@@ -186,6 +189,8 @@ class Model:
         if guard is not None:
             a["guard"] = guard
         a["effects"] = list(effects)
+        if not normalize:
+            a["normalize"] = False
         self.doc["actions"].append(a)
 
     def normalize(self, *effects):

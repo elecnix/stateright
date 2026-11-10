@@ -12,7 +12,7 @@ pub type Sym = u32;
 ///
 /// Lists and records share their contents through [`Arc`], so copying a state
 /// copies pointers, and an update copies only the path it changes.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Value {
     /// JSON `null`.
     #[default]
@@ -27,6 +27,34 @@ pub enum Value {
     List(Arc<Vec<Value>>),
     /// A JSON object. Fields are sorted by symbol, which is lexical order.
     Rec(Arc<Vec<(Sym, Value)>>),
+}
+
+/// Hashes each value with one write: a tag in the high word and the payload
+/// in the low word. The checker fingerprints every successor state, so this
+/// is on the hot path. It agrees with `Eq`: equal values write equal words.
+impl std::hash::Hash for Value {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        let word = |tag: u128, payload: u64| (tag << 64) | payload as u128;
+        match self {
+            Value::Null => h.write_u128(word(0, 0)),
+            Value::Bool(b) => h.write_u128(word(1, *b as u64)),
+            Value::Int(i) => h.write_u128(word(2, *i as u64)),
+            Value::Str(s) => h.write_u128(word(3, *s as u64)),
+            Value::List(items) => {
+                h.write_u128(word(4, items.len() as u64));
+                for v in items.iter() {
+                    v.hash(h);
+                }
+            }
+            Value::Rec(fields) => {
+                h.write_u128(word(5, fields.len() as u64));
+                for (k, v) in fields.iter() {
+                    h.write_u32(*k);
+                    v.hash(h);
+                }
+            }
+        }
+    }
 }
 
 impl Value {
