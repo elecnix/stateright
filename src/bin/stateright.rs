@@ -3,6 +3,13 @@
 use stateright::declarative::{CheckOptions, JsonModel, check};
 use std::process::ExitCode;
 
+// The checker's threads allocate and free small lists all the time. With
+// musl, which the released Linux binary links, the system allocator takes
+// one lock for every thread, and four threads ran slower than one.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const USAGE: &str = "\
 usage: stateright check [--threads N] [--max-depth N] [--output FILE] MODEL.json
        stateright --version
