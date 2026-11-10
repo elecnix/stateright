@@ -231,9 +231,11 @@ where
             // Done if discoveries found for all properties.
             let mut is_awaiting_discoveries = false;
             for (i, property) in properties.iter().enumerate() {
-                if discoveries.contains_key(property.name)
-                    && (property.expectation == Expectation::Eventually)
+                // The cheap tests come first: the discoveries map is shared
+                // between threads, and most properties are not eventualities.
+                if property.expectation == Expectation::Eventually
                     && !ebits.contains(i)
+                    && discoveries.contains_key(property.name)
                 {
                     continue;
                 }
@@ -297,8 +299,6 @@ where
                 if next_state.is_none() {
                     continue;
                 }
-                let mut next_action_path = action_path.clone();
-                next_action_path.push(action_idx);
                 let next_state = next_state.unwrap();
                 // Skip if outside boundary.
                 if !model.within_boundary(&next_state) {
@@ -343,8 +343,13 @@ where
                     }
                 }
 
-                // Otherwise further checking is applicable.
+                // Otherwise further checking is applicable. Only a state that
+                // will be visited needs its path, so the path is built here,
+                // after the duplicates are gone, and in one allocation.
                 is_terminal = false;
+                let mut next_action_path = Vec::with_capacity(action_path.len() + 1);
+                next_action_path.extend_from_slice(&action_path);
+                next_action_path.push(action_idx);
                 pending.push_front((next_state, ebits.clone(), next_depth, next_action_path));
             }
             if is_terminal {

@@ -2,9 +2,11 @@
 
 use super::expr::{Ctx, Def, Effect, Expr, Scope, binding, compile, compile_effects};
 use super::value::{Symbols, Value, collect_strings};
-use crate::{Model, Property};
+use crate::{Fingerprint, Model, Property, fingerprint};
 use dashmap::DashSet;
+use nohash_hasher::NoHashHasher;
 use std::fmt;
+use std::hash::BuildHasherDefault;
 use std::sync::{Arc, Mutex};
 
 /// The schema version this crate reads, in the document's `"stateright"` key.
@@ -87,7 +89,9 @@ pub struct JsonModel {
     pub(crate) max_depth: Option<usize>,
     /// Distinct states reached by a step that violated a transition
     /// invariant. They are terminal and are not states of the system.
-    pub(crate) flagged: DashSet<JsonState>,
+    /// The set holds fingerprints, which is how the checker tells states
+    /// apart, so the two counts subtract exactly.
+    pub(crate) flagged: DashSet<Fingerprint, BuildHasherDefault<NoHashHasher<u64>>>,
     /// The first evaluation error. An error stops no thread by itself, so
     /// [`check`](super::check) reports it once the search ends.
     pub(crate) error: Mutex<Option<String>>,
@@ -313,7 +317,7 @@ impl JsonModel {
             invariants,
             properties: Vec::new(),
             max_depth,
-            flagged: DashSet::new(),
+            flagged: DashSet::default(),
             error: Mutex::new(None),
         };
         model.properties = model
@@ -649,7 +653,7 @@ impl Model for JsonModel {
 
     fn next_state(&self, _state: &JsonState, action: JsonAction) -> Option<JsonState> {
         if action.next.violated != 0 {
-            self.flagged.insert(action.next.clone());
+            self.flagged.insert(fingerprint(&action.next));
         }
         Some(action.next)
     }
