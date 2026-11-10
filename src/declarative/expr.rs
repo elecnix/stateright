@@ -56,20 +56,53 @@ pub(crate) struct Hints {
     /// Whether every key is a literal or a local, so the path can be read
     /// in place. See [`simple`].
     simple: bool,
-    /// For each key, the position where a record last had it. Records built
-    /// by the same expression have the same fields, so the position is
-    /// usually right and saves the search. Threads may race to store it,
-    /// and a stale position only costs the search.
-    found: Vec<AtomicU32>,
+    /// One entry per key of the path.
+    keys: Vec<Key>,
+}
+
+/// A key of a path, sorted by how it is read. Each kind carries the
+/// position where a record last had the key at this place in the model.
+/// Records built by the same expression have the same fields, so the
+/// position is usually right and saves the search. Threads may race to
+/// store it, and a stale position only costs the search.
+#[derive(Debug)]
+enum Key {
+    /// A literal string: a record's field.
+    Name(Sym, AtomicU32),
+    /// A literal integer that is not negative: a list's item.
+    Index(usize),
+    /// The value of a local.
+    Local(usize, AtomicU32),
+    /// Any other expression.
+    Other(AtomicU32),
 }
 
 impl Hints {
     fn of(keys: &[Expr]) -> Hints {
+        let found = || AtomicU32::new(0);
         Hints {
             simple: keys
                 .iter()
                 .all(|k| matches!(k, Expr::Lit(_) | Expr::Local(_))),
-            found: keys.iter().map(|_| AtomicU32::new(0)).collect(),
+            keys: keys
+                .iter()
+                .map(|k| match k {
+                    Expr::Lit(Value::Str(s)) => Key::Name(*s, found()),
+                    Expr::Lit(Value::Int(i)) if *i >= 0 => Key::Index(*i as usize),
+                    Expr::Local(l) => Key::Local(*l, found()),
+                    _ => Key::Other(found()),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl Key {
+    fn found(&self) -> &AtomicU32 {
+        static UNUSED: AtomicU32 = AtomicU32::new(0);
+        match self {
+            Key::Name(_, found) | Key::Local(_, found) | Key::Other(found) => found,
+            Key::Index(_) => &UNUSED,
         }
     }
 }
@@ -596,6 +629,16 @@ fn no_key(symbols: &Symbols, cur: &Value, key: &Value) -> EvalError {
     ))
 }
 
+/// Stores an integer in a slot. A slot that already has an integer, as in
+/// every round of a loop but the first, takes the new one in place.
+#[inline(always)]
+fn set_int(slot: &mut Value, i: i64) {
+    match slot {
+        Value::Int(old) => *old = i,
+        _ => *slot = Value::Int(i),
+    }
+}
+
 /// Whether two values are equal. Scalars of the same type compare here,
 /// without a call.
 #[inline(always)]
@@ -1059,8 +1102,8 @@ impl<'a> Ctx<'a> {
                         Root::Field(f) => &state[*f],
                         Root::Local(l) => &self.stack[base + l],
                     };
-                    for (key, found) in evaluated.iter().zip(&hints.found) {
-                        cur = step(self.symbols, cur, key, found)?;
+                    for (key, hint) in evaluated.iter().zip(&hints.keys) {
+                        cur = step(self.symbols, cur, key, hint.found())?;
                     }
                     cur.clone()
                 }
@@ -1323,25 +1366,30 @@ impl<'a> Ctx<'a> {
         let mut count = 0;
         for step in 0..n {
             let i = if backwards { n - 1 - step } else { step };
-            self.stack[base + slot] = item(i);
+            match &items {
+                Domain::Range(from, _) => set_int(&mut self.stack[base + slot], from + i as i64),
+                Domain::List(list) => self.stack[base + slot] = list[i].clone(),
+            }
             if indexed {
-                self.stack[base + slot + 1] = Value::Int(i as i64);
+                set_int(&mut self.stack[base + slot + 1], i as i64);
             }
             match op {
                 IterOp::Map => mapped.push(self.eval(body, state, base)?),
                 IterOp::SortBy => keyed.push((self.eval(body, state, base)?, i)),
                 _ => {
-                    let hit = self.test(body, state, base, "an iteration")?;
-                    match op {
-                        IterOp::Filter if hit => mapped.push(item(i)),
-                        IterOp::Count if hit => count += 1,
-                        IterOp::Some if hit => return Ok(Value::Bool(true)),
-                        IterOp::All if !hit => return Ok(Value::Bool(false)),
-                        IterOp::Find | IterOp::FindLast if hit => return Ok(item(i)),
-                        IterOp::FindIndex | IterOp::FindLastIndex if hit => {
-                            return Ok(Value::Int(i as i64));
+                    if self.test(body, state, base, "an iteration")? {
+                        match op {
+                            IterOp::Filter => mapped.push(item(i)),
+                            IterOp::Count => count += 1,
+                            IterOp::Some => return Ok(Value::Bool(true)),
+                            IterOp::Find | IterOp::FindLast => return Ok(item(i)),
+                            IterOp::FindIndex | IterOp::FindLastIndex => {
+                                return Ok(Value::Int(i as i64));
+                            }
+                            _ => {}
                         }
-                        _ => {}
+                    } else if op == IterOp::All {
+                        return Ok(Value::Bool(false));
                     }
                 }
             }
@@ -1527,13 +1575,25 @@ impl<'a> Ctx<'a> {
             Root::Field(f) => &state[f],
             Root::Local(l) => &self.stack[base + l],
         };
-        for (k, found) in keys.iter().zip(&hints.found) {
-            let key = match k {
-                Expr::Lit(v) => v,
-                Expr::Local(l) => &self.stack[base + l],
-                _ => unreachable!("a simple path with a computed key"),
+        for (i, key) in hints.keys.iter().enumerate() {
+            cur = match (key, cur) {
+                (Key::Name(name, found), Value::Rec(r)) => {
+                    match r.get(found.load(AtomicOrdering::Relaxed) as usize) {
+                        Some((k, v)) if k == name => v,
+                        _ => step(self.symbols, cur, self.peek(&keys[i], state, base)?, found)?,
+                    }
+                }
+                (Key::Index(at), Value::List(l)) if *at < l.len() => &l[*at],
+                (Key::Local(slot, found), _) => {
+                    step(self.symbols, cur, &self.stack[base + slot], found)?
+                }
+                _ => step(
+                    self.symbols,
+                    cur,
+                    self.peek(&keys[i], state, base)?,
+                    key.found(),
+                )?,
             };
-            cur = step(self.symbols, cur, key, found)?;
         }
         Ok(cur)
     }
