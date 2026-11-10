@@ -451,7 +451,7 @@ mod test {
                     }),
                     properties: vec![
                         (Expectation::Always, "delta within 1".into(), None),
-                        (Expectation::Sometimes, "can reach max".into(), Some("0/1/1/1/1/0".into())),
+                        (Expectation::Sometimes, "can reach max".into(), Some("0/1/1/1".into())),
                         (Expectation::Eventually, "must reach max".into(), Some("0/1/1/0".into())),
                         (Expectation::Eventually, "must exceed max".into(), Some("0/1/1/1/1/0".into())),
                         (Expectation::Always, "#in <= #out".into(), None),
@@ -479,7 +479,7 @@ mod test {
                 }),
                 properties: vec![
                     (Expectation::Always, "delta within 1".into(), None),
-                    (Expectation::Sometimes, "can reach max".into(), Some("0/1/1/1/1/0".into())),
+                    (Expectation::Sometimes, "can reach max".into(), Some("0/1/1/1".into())),
                     (Expectation::Eventually, "must reach max".into(), Some("0/1/1/0".into())),
                     (Expectation::Eventually, "must exceed max".into(), Some("0/1/1/1/1/0".into())),
                     (Expectation::Always, "#in <= #out".into(), None),
@@ -509,7 +509,7 @@ mod test {
                 }),
                 properties: vec![
                     (Expectation::Always, "delta within 1".into(), None),
-                    (Expectation::Sometimes, "can reach max".into(), Some("0/1/1/1/1/0".into())),
+                    (Expectation::Sometimes, "can reach max".into(), Some("0/1/1/1".into())),
                     (Expectation::Eventually, "must reach max".into(), Some("0/1/1/0".into())),
                     (Expectation::Eventually, "must exceed max".into(), Some("0/1/1/1/1/0".into())),
                     (Expectation::Always, "#in <= #out".into(), None),

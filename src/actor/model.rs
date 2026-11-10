@@ -1161,7 +1161,8 @@ mod test {
                 .unwrap()
                 .last_state()
                 .actor_states,
-            vec![Arc::new(5), Arc::new(5)]
+            // The first state breadth-first search finds with an actor at 5.
+            vec![Arc::new(4), Arc::new(5)]
         );
     }
 
