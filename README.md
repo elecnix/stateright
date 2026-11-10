@@ -42,6 +42,167 @@ these secrets, and through them use the key. Today only the repository owner
 has push access.
 
 
+## Declarative JSON models
+
+`stateright check MODEL.json` checks a transition system written as JSON,
+with the same breadth-first engine as `spawn_bfs`. It needs no Rust
+toolchain: the [releases](https://github.com/elecnix/stateright/releases)
+carry prebuilt binaries for macOS arm64 and Linux x86_64. A Rust program can
+load the same file with `stateright::declarative::JsonModel`.
+
+```
+stateright check [--threads N] [--max-depth N] [--output FILE] MODEL.json
+```
+
+The exit status is 0 when every `always` and `transition` invariant holds,
+1 when one is violated, and 2 for a usage error or an error in the model.
+With `--threads 1`, every trace is a shortest path, and two runs report the
+same trace. With more threads, each trace is the shortest one found before
+the search stopped.
+
+[`py/stateright_model.py`](py/stateright_model.py) builds these documents
+from Python. [`py/examples/required_checks.py`](py/examples/required_checks.py)
+is a complete model: a pull request whose required checks run, pass, fail
+and get re-run while the head and base move.
+
+### The document
+
+```json
+{
+  "stateright": 1,
+  "name": "counter",
+  "init": [{"n": 0}],
+  "defs": {"next": {"params": ["x"], "body": {"+": [{"var": "x"}, 1]}}},
+  "actions": [
+    {"name": "inc", "for": [["by", [1, 2]]],
+     "guard": {"<": [{"var": "n"}, 5]},
+     "effects": [{"set": "n", "to": {"+": [{"var": "n"}, {"var": "by"}]}}]}
+  ],
+  "normalize": [],
+  "invariants": [{"name": "small", "always": {"<=": [{"var": "n"}, 6]}}],
+  "max_depth": 10
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `stateright` | Schema version. This crate reads `1`. |
+| `name`, `description` | Text for the report. |
+| `init` | Initial states. Each is a JSON object, and every one has the same fields. Those fields are the state; actions change their values and never add or remove a field. |
+| `defs` | Named functions: `params` and an expression `body`. A def can call another def, and recursion is rejected. |
+| `actions` | Guarded updates, described below. |
+| `normalize` | Effects run after every action, before the checker compares states. Use it to put states in a canonical form, such as sorting a list whose order means nothing. |
+| `invariants` | Up to 64 properties, described below. |
+| `max_depth` | Optional. Explore at most this many actions from an initial state. Without it, the model's own guards must keep the state space finite. |
+
+Values are JSON values: `null`, booleans, 64-bit integers, strings, arrays
+and objects. Floating point numbers are rejected. A set is an array; the set
+operations sort their result and drop duplicates, so two equal sets compare
+equal.
+
+### Actions
+
+| Key | Meaning |
+|---|---|
+| `name` | Shown in traces. |
+| `for` | Parameters: `[["name", list], ...]`. The action runs once per combination, in order. A later parameter's list can use the earlier ones, as in `[["i", {"range": [0, {"len": {"var": "xs"}}]}]]`. |
+| `let` | Names bound in order, before the guard: `[["name", expression], ...]`. |
+| `guard` | A boolean expression. The action is enabled when it is true. |
+| `effects` | Updates, applied in order. Each effect sees the state as the effects before it left it. |
+
+Effects:
+
+| Effect | Meaning |
+|---|---|
+| `{"set": PATH, "to": E}` | Sets the value at PATH. |
+| `{"append": PATH, "value": E}` | Appends to the array at PATH. |
+| `{"clear": PATH}` | Empties the array at PATH, or sets any other value to `null`. |
+| `{"remove": PATH, "at": E}` | Removes one element of the array at PATH. |
+| `{"if": E, "then": [...], "else": [...]}` | Runs one branch. `else` is optional. |
+| `{"let": "name", "be": E}` | Binds a name for the effects after it. |
+| `{"require": E}` | Disables the action when E is false, discarding the effects so far. |
+| `{"violate": "name"}` | Reports that this step breaks the transition invariant `name`. |
+
+A PATH is a field name, or an array that starts with a field name and
+continues with keys and indexes: `["runs", {"var": "i"}, "status"]`.
+
+### Expressions
+
+An expression is a literal, an array of expressions (which builds an
+array), or an object with one key that names an operation. Strings are
+literals. `{"var": "x"}` reads a local name (a parameter, a `let`, a def
+parameter or an iteration variable) or else a state field. `{"lit": V}`
+is V as it is, and `{"obj": {"k": E}}` builds an object.
+
+| Operations | Meaning |
+|---|---|
+| `and`, `or`, `not` | Booleans, short-circuiting. |
+| `if` | `[c, a, b]`, or `[c1, a1, c2, a2, ..., else]`. |
+| `==`, `!=` | Deep equality of any two values. |
+| `<`, `<=`, `>`, `>=` | Ordering of two values of one type. |
+| `+`, `*`, `min`, `max` | Integers, two or more arguments. |
+| `-`, `/`, `%` | Integers, two arguments. Division rounds down, and `%` takes the sign of the divisor. Overflow is an error. |
+| `get` | `[x, key]` reads an object key or an array index (negative counts from the end). `[x, key, default]` returns the default when the key is missing. |
+| `len` | Length of an array or object. |
+| `range` | `[a, b]` is the integers from a up to b, excluding b. |
+| `slice` | `[xs, from]` or `[xs, from, to]`, with Python's rules for negative and out-of-range bounds. |
+| `concat` | Joins arrays. |
+| `set_at`, `with` | `[xs, i, v]` and `[obj, key, v]` return a copy with one element replaced. |
+| `in`, `index_of` | `[x, xs]` membership; `[xs, x]` is the first index of x, or `null`. |
+| `union`, `intersect`, `difference`, `subset` | Sets. |
+| `map`, `filter`, `some`, `all`, `count`, `find`, `find_last`, `find_index`, `find_last_index`, `sort_by` | `[xs, binder, body]`. The binder is a name for the element, or `["x", "i"]` for the element and its index. The `find` operations return `null` when nothing matches. `sort_by` is stable. |
+| `let` | `[[["a", E1], ["b", E2]], body]`, bound in order. |
+| `call` | `["def name", arguments...]`. |
+
+A type error, a missing key or an overflow is an error in the model. The
+check stops with exit status 2 and names the action or invariant.
+
+### Invariants
+
+| Form | Meaning |
+|---|---|
+| `{"name": N, "always": E}` | E holds in every reachable state. The report gives a shortest trace to a state where it fails. |
+| `{"name": N, "sometimes": E}` | Some reachable state satisfies E. The report gives a trace to one. |
+| `{"name": N, "transition": true}` | A property of steps. An action reports a violation with `{"violate": N}`, and the report gives a trace that ends with that step. The step still happens: the search continues from its target. |
+
+### The report
+
+```json
+{
+  "model": "counter",
+  "result": "ok",
+  "states": 7,
+  "max_depth": 10,
+  "depth_reached": 3,
+  "threads": 1,
+  "seconds": 0.001,
+  "complete": true,
+  "invariants": [
+    {"name": "small", "kind": "always", "status": "holds"}
+  ]
+}
+```
+
+`result` is `ok` or `violated`. `states` counts distinct states. `complete`
+is false when the search stopped early because every invariant already had
+a result. A trace is a list of steps. The first step has only the initial
+`state`. Each later step has the `action` taken (`{"name", "args"}`) and the
+`state` it led to. A step that breaks a transition invariant lists it under
+`violates`.
+
+### Conformance and speed
+
+CI runs [`py/conformance.py`](py/conformance.py). It checks the
+required-checks example through the binary and compares the result with a
+plain Python breadth-first search of the same system. The distinct state
+counts match (4,756, 15,965, 3,752,047 and 7,585,107 states), and for each
+seeded bug the counterexample matches step for step.
+
+The JSON route is slower than a model written in Rust. On the 3,752,047-state
+configuration with 8 threads, it took 1.5 to 2.6 s, against 0.6 s for the
+same model as a Rust `Model`. A breadth-first search in Python took 11.5 s on
+one core.
+
 ## Getting Started
 
 1. **Please see the book, "[Building Distributed Systems With
